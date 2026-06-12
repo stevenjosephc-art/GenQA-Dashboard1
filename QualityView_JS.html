@@ -1,0 +1,1792 @@
+<script>
+function statusIcon(pass) {
+  if (pass) {
+    return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="12" cy="12" r="10" fill="#34C759" opacity="0.15"/>
+      <circle cx="12" cy="12" r="10" stroke="#34C759" stroke-width="2"/>
+      <path d="M7.5 12l3 3 6-6" stroke="#34C759" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`;
+  } else {
+    return `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="12" cy="12" r="10" fill="#FF3B30" opacity="0.15"/>
+      <circle cx="12" cy="12" r="10" stroke="#FF3B30" stroke-width="2"/>
+      <path d="M15 9l-6 6M9 9l6 6" stroke="#FF3B30" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`;
+  }
+}
+
+var _agentListCache = null;
+var _supListCache = null;
+
+// State Management
+const State = {
+  initialData: null,
+  currentTab: 'agent',
+  trendView: 'weekly',
+  auditFilter: 'all',
+  selectedMonth: '',
+  selectedLdap: '',
+  selectedSup: '',
+  selectedMgr: '',
+  selectedLob: '',
+  filteredData: null,
+  loading: false,
+  _autoJumped: false
+};
+
+// Initialization
+document.addEventListener('DOMContentLoaded', () => {
+  initTheme();
+  initApp();
+});
+
+function initTheme() {
+    const savedTheme = localStorage.getItem('q_theme');
+    const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+    if (savedTheme === 'dark' || (!savedTheme && systemDark)) {
+        document.body.setAttribute('data-theme', 'dark');
+        updateThemeUI(true);
+    }
+}
+
+function toggleDarkMode() {
+    const isDark = document.body.getAttribute('data-theme') === 'dark';
+    const newDark = !isDark;
+
+    document.body.setAttribute('data-theme', newDark ? 'dark' : 'light');
+    localStorage.setItem('q_theme', newDark ? 'dark' : 'light');
+    updateThemeUI(newDark);
+
+    // Refresh charts to match theme colors
+    renderView();
+}
+
+function updateThemeUI(isDark) {
+    const icon = document.getElementById('theme-icon');
+    const text = document.getElementById('theme-text');
+    if (icon) icon.className = isDark ? 'ph ph-sun' : 'ph ph-moon';
+    if (text) text.textContent = isDark ? 'Light Mode' : 'Dark Mode';
+}
+
+async function initApp(forceRefresh = false) {
+  showLoader(true);
+  console.log('QualityOS: Booting...');
+
+  const root = document.getElementById('quality-root');
+  if (root) {
+      root.style.display = 'flex';
+      root.style.opacity = '0.3';
+  }
+
+  try {
+    let data = null;
+
+    // 1. Check Bootstrap first (most fresh for this session start)
+    if (!forceRefresh && typeof BOOTSTRAP_DATA !== 'undefined' && BOOTSTRAP_DATA && !BOOTSTRAP_DATA.error) {
+        data = BOOTSTRAP_DATA;
+        console.log('QualityOS: Loaded Initial Data from Bootstrap');
+    }
+
+    // 2. Check LocalStorage for even faster boot (stale-while-revalidate)
+    if (!data && !forceRefresh) {
+        try {
+            const cached = localStorage.getItem('q_initial_data_v2');
+            if (cached) {
+                data = JSON.parse(cached);
+                console.log('QualityOS: Loaded Initial Data from LocalStorage');
+            }
+        } catch (e) {}
+    }
+
+    if (!data) {
+        data = await callServer('clientGetInitialData', [forceRefresh]);
+        console.log('QualityOS: Initial Data Received from Server', data);
+    }
+
+    if (!data) throw new Error("Server returned empty data. Check sheet connectivity.");
+    State.initialData = data;
+
+    // Persist for next time
+    try { localStorage.setItem('q_initial_data_v2', JSON.stringify(data)); } catch (e) {}
+
+    // UI Setup
+    if (data.session) {
+        updateUserInfo(data.session);
+        if (!State.selectedLdap) State.selectedLdap = data.session.ldap;
+    }
+
+    // Restore previous state if exists
+    try {
+        const savedTab = localStorage.getItem('q_last_tab');
+        if (savedTab && !forceRefresh) State.currentTab = savedTab;
+
+        const savedLdap = localStorage.getItem('q_last_ldap');
+        if (savedLdap && !forceRefresh) State.selectedLdap = savedLdap;
+    } catch(e) {}
+
+    // Use preloaded data from bootstrap for instant first render
+    if (data.preloadedData && data.preloadedData.hasData) {
+      State.filteredData = data.preloadedData;
+      if (!State.selectedMonth) State.selectedMonth = data.preloadedData.month;
+      renderView();
+    } else if (data.months && data.months.length > 0) {
+      // Preloaded month had no data — find the first month that has audits
+      const tryMonths = data.months.slice(0, 6); // try up to 6 most recent months
+      (async function findFirstWithData() {
+        for (const m of tryMonths) {
+          try {
+            const result = await callServer('clientGetMyQuality', [State.selectedLdap, m, false]);
+            if (result && result.hasData) {
+              State.selectedMonth = m;
+              State.filteredData = result;
+              const picker = document.getElementById('quality-month-picker');
+              if (picker) picker.value = m;
+              renderView();
+              return;
+            }
+          } catch(e) {}
+        }
+      })();
+    }
+
+    // Reveal Dashboard early for "Instant" feel
+    if (root) {
+        root.style.opacity = '1';
+        root.classList.add('fade-in');
+        console.log('QualityOS: Root displayed (Partial Load).');
+    }
+
+    // Start background loading of remaining metadata (Parallel)
+    loadMetadata(forceRefresh);
+
+    // Initialize tab with whatever we have (mostly shells)
+    switchTab(State.currentTab);
+
+  } catch (e) {
+    console.error('QualityOS Error:', e);
+    if (root) {
+        root.style.opacity = '1';
+    }
+    const content = document.getElementById('view-content');
+    if (content) {
+        content.innerHTML = `
+            <div class="card grid-span-4" style="text-align:center; padding: 60px;">
+                <i class="ph ph-warning-octagon" style="font-size: 48px; color: var(--apple-red);"></i>
+                <h3>Initialization Failed</h3>
+                <p style="color: var(--text-secondary); margin: 10px 0 20px;">${e.message}</p>
+                <button class="icon-button" onclick="initApp(true)" style="margin: 0 auto; width: auto; padding: 0 20px;">
+                    <i class="ph ph-arrows-clockwise"></i> Try Again
+                </button>
+            </div>
+        `;
+    } else {
+        alert('Dashboard Overhaul Error: ' + e.message);
+    }
+  } finally {
+    showLoader(false);
+  }
+}
+
+function updateUserInfo(session) {
+    if (!session) return;
+    const nameEl = document.getElementById('user-ldap');
+    const initEl = document.getElementById('user-initials');
+    if (nameEl) nameEl.textContent = session.ldap || 'User';
+    if (initEl && session.ldap) initEl.textContent = session.ldap.substring(0, 2).toUpperCase();
+}
+
+// UI Handlers
+function populateMonthPicker() {
+  const picker = document.getElementById('quality-month-picker');
+  if (!picker || !State.initialData || !State.initialData.months) return;
+  picker.innerHTML = State.initialData.months.map(m =>
+    `<option value="${m}" ${m === State.selectedMonth ? 'selected' : ''}>${m}</option>`
+  ).join('');
+}
+
+function populateLobPicker() {
+  const lobSelect = document.getElementById('lob-select');
+  const teamLobSelect = document.getElementById('team-lob-select');
+  if (!State.initialData || !State.initialData.hierarchy) return;
+
+  const lobs = Object.keys(State.initialData.hierarchy);
+  const options = '<option value="">Select LOB...</option>' +
+    lobs.map(l => `<option value="${l}">${l}</option>`).join('');
+
+  if (lobSelect) lobSelect.innerHTML = options;
+  if (teamLobSelect) teamLobSelect.innerHTML = options;
+}
+
+function populateMgrPicker() {
+  const mgrSelect = document.getElementById('mgr-select');
+  if (!mgrSelect || !State.initialData || !State.initialData.managers) return;
+
+  mgrSelect.innerHTML = '<option value="">Select Manager...</option>' +
+    State.initialData.managers.map(m => `<option value="${m}">${m}</option>`).join('');
+}
+
+function onMonthChange(val) {
+  State.selectedMonth = val;
+  fetchData();
+}
+
+function onLobChange(val) {
+  State.selectedLob = val;
+}
+
+function onAgentSupChange(val) {
+  State.selectedSup = val;
+}
+
+function onTeamLobChange(val) {
+  State.selectedLob = val;
+  const supSelect = document.getElementById('team-sup-select');
+  if (val && State.initialData.hierarchy[val]) {
+    const sups = Object.keys(State.initialData.hierarchy[val]);
+    if (supSelect) {
+        supSelect.innerHTML = '<option value="">Select Supervisor...</option>' +
+          sups.map(s => `<option value="${s}">${s}</option>`).join('');
+        supSelect.disabled = false;
+    }
+  } else if (supSelect) {
+    supSelect.innerHTML = '<option value="">Select Supervisor...</option>';
+    supSelect.disabled = true;
+  }
+}
+
+function onTeamSupChange(val) {
+  State.selectedSup = val;
+  fetchData();
+}
+
+function onMgrChange(val) {
+  State.selectedMgr = val;
+  fetchData();
+}
+
+function setupAutocomplete(id, type, dataFn) {
+  const input = document.getElementById(`${id}-input`);
+  const list = document.getElementById(`${id}-list`);
+  if (!input || !list) return;
+
+  input.addEventListener('input', (e) => {
+    const val = e.target.value.toLowerCase();
+    list.innerHTML = '';
+    if (!val) {
+      list.style.display = 'none';
+      return;
+    }
+
+    const items = dataFn();
+    const matches = items.filter(a => a.toLowerCase().includes(val)).slice(0, 10);
+
+    if (matches.length > 0) {
+      matches.forEach(m => {
+        const item = document.createElement('div');
+        item.className = 'autocomplete-item';
+        const idx = m.toLowerCase().indexOf(val);
+        if (idx !== -1) {
+            const before = m.substring(0, idx);
+            const match = m.substring(idx, idx + val.length);
+            const after = m.substring(idx + val.length);
+            item.innerHTML = `${before}<b>${match}</b>${after}`;
+        } else {
+            item.textContent = m;
+        }
+        item.onclick = () => {
+          input.value = m;
+          list.style.display = 'none';
+          if (type === 'ldap') { State.selectedLdap = m; localStorage.setItem('q_last_ldap', m); }
+          else if (type === 'sup') State.selectedSup = m;
+          else if (type === 'mgr') State.selectedMgr = m;
+          fetchData();
+        };
+        list.appendChild(item);
+      });
+      list.style.display = 'block';
+    } else {
+      list.style.display = 'none';
+    }
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        const matches = dataFn().filter(a => a.toLowerCase().includes(input.value.toLowerCase()));
+        if (matches.length > 0) {
+            const m = matches[0];
+            input.value = m;
+            list.style.display = 'none';
+            if (type === 'ldap') { State.selectedLdap = m; localStorage.setItem('q_last_ldap', m); }
+            else if (type === 'sup') State.selectedSup = m;
+            else if (type === 'mgr') State.selectedMgr = m;
+            fetchData();
+            input.blur();
+        }
+    }
+  });
+
+  document.addEventListener('click', (e) => {
+    if (e.target !== input) list.style.display = 'none';
+  });
+}
+
+function setupLDAPAutocomplete() {
+  setupAutocomplete('ldap-search', 'ldap', getAllAgentsFromHierarchy);
+  setupAutocomplete('sup-search', 'sup', getAllSupervisorsFromHierarchy);
+  setupAutocomplete('mgr-search', 'mgr', () => State.initialData.managers || []);
+}
+
+function getAllSupervisorsFromHierarchy() {
+  if (_supListCache) return _supListCache;
+  const sups = new Set();
+  if (!State.initialData || !State.initialData.hierarchy) return [];
+  const h = State.initialData.hierarchy;
+  for (const lob in h) {
+    for (const sup in h[lob]) {
+        sups.add(sup);
+    }
+  }
+  _supListCache = Array.from(sups).sort();
+  return _supListCache;
+}
+
+function getAllAgentsFromHierarchy() {
+  if (_agentListCache && _agentListCache.length > 0) return _agentListCache;
+  if (!State.initialData || !State.initialData.hierarchy) return [];
+  const agents = new Set();
+  const h = State.initialData.hierarchy;
+  for (const lob in h) {
+    for (const sup in h[lob]) {
+      if (Array.isArray(h[lob][sup])) {
+          h[lob][sup].forEach(a => agents.add(a));
+      }
+    }
+  }
+  _agentListCache = Array.from(agents).sort();
+  return _agentListCache;
+}
+
+async function loadMetadata(forceRefresh = false) {
+  if (!forceRefresh && State.initialData.hierarchy && State.initialData.months) {
+    if (!State.selectedMonth && State.initialData.months.length > 0) {
+      State.selectedMonth = State.initialData.months[0];
+    }
+    populateMonthPicker();
+    populateLobPicker();
+    populateMgrPicker();
+    setupLDAPAutocomplete();
+    // Don't call fetchData here — initApp handles the first render via preloadedData
+    return;
+  }
+
+  try {
+    const [months, hierarchyData] = await Promise.all([
+      callServer('clientGetAvailableQualityMonths', [forceRefresh]),
+      callServer('clientGetHierarchy', [forceRefresh])
+    ]);
+    State.initialData.months = months;
+    State.initialData.hierarchy = hierarchyData.tree;
+    State.initialData.managers = hierarchyData.managers;
+    try {
+      localStorage.setItem('q_meta_cache', JSON.stringify({
+        months, hierarchy: hierarchyData.tree, managers: hierarchyData.managers
+      }));
+    } catch(e) {}
+    if (!State.selectedMonth && months?.length > 0) State.selectedMonth = months[0];
+    populateMonthPicker();
+    populateLobPicker();
+    populateMgrPicker();
+    setupLDAPAutocomplete();
+    if (!State.filteredData && State.selectedLdap && State.selectedMonth) fetchData();
+  } catch(e) {
+    console.error('Metadata load failed:', e);
+  }
+}
+
+async function fetchData(forceRefresh = false) {
+  if (State.loading) return;
+
+  // Don't fetch if metadata isn't ready
+  if (!State.initialData.months) {
+    console.log('fetchData: Waiting for metadata...');
+    return;
+  }
+
+  // Don't fetch if required selection is missing for the current tab
+  if (State.currentTab === 'agent' && !State.selectedLdap) return;
+  if (State.currentTab === 'team' && !State.selectedSup) return;
+  if (State.currentTab === 'cluster' && !State.selectedMgr) return;
+
+  State.loading = true;
+
+  // Try to load cached data for this specific selection for instant UI
+  try {
+      const cacheKey = `q_data_cache_${State.currentTab}_${State.selectedLdap || State.selectedSup || State.selectedMgr}_${State.selectedMonth}`;
+      const cached = localStorage.getItem(cacheKey);
+      if (cached && !forceRefresh) {
+          State.filteredData = JSON.parse(cached);
+          console.log('QualityOS: Data loaded from LocalStorage Cache');
+          renderView();
+          // We still fetch fresh data in background
+      }
+  } catch(e) {}
+
+  const content = document.getElementById('view-content');
+  if (content && !State.filteredData) {
+    content.innerHTML = `
+      <div class="skeleton-card grid-span-4"><div class="skeleton" style="height:100px; margin-bottom:16px;"></div><div class="skeleton" style="height:20px; width:60%;"></div></div>
+      <div class="skeleton-card"><div class="skeleton" style="height:80px; margin-bottom:12px;"></div><div class="skeleton" style="height:36px; width:50%;"></div></div>
+      <div class="skeleton-card"><div class="skeleton" style="height:80px; margin-bottom:12px;"></div><div class="skeleton" style="height:36px; width:50%;"></div></div>
+      <div class="skeleton-card"><div class="skeleton" style="height:80px; margin-bottom:12px;"></div><div class="skeleton" style="height:36px; width:50%;"></div></div>
+      <div class="skeleton-card"><div class="skeleton" style="height:80px; margin-bottom:12px;"></div><div class="skeleton" style="height:36px; width:50%;"></div></div>
+      <div class="skeleton-card grid-span-4"><div class="skeleton" style="height:300px;"></div></div>
+    `;
+  }
+
+  try {
+    let result;
+    if (State.currentTab === 'agent') {
+      if (!State.selectedLdap) throw new Error("Please select an agent.");
+      result = await callServer('clientGetMyQuality', [State.selectedLdap, State.selectedMonth, forceRefresh]);
+    } else if (State.currentTab === 'team') {
+      if (!State.selectedSup) throw new Error("Please select a supervisor.");
+      result = await callServer('clientGetTeamQuality', [State.selectedSup, State.selectedMonth, forceRefresh]);
+    } else if (State.currentTab === 'cluster') {
+      if (!State.selectedMgr) throw new Error("Please select a manager.");
+      result = await callServer('clientGetClusterQuality', [State.selectedMgr, State.selectedMonth, forceRefresh]);
+    }
+
+    const hasChanged = JSON.stringify(State.filteredData) !== JSON.stringify(result);
+    State.filteredData = result;
+
+    // Persist to local cache
+    try {
+        const cacheKey = `q_data_cache_${State.currentTab}_${State.selectedLdap || State.selectedSup || State.selectedMgr}_${State.selectedMonth}`;
+        localStorage.setItem(cacheKey, JSON.stringify(result));
+    } catch(e) {}
+
+    if (hasChanged) renderView();
+  } catch (e) {
+    console.error('Fetch Error:', e);
+    if (content) {
+        content.innerHTML = `<div class="card grid-span-4" style="text-align:center; color: var(--apple-red);">Oops! ${e.message}</div>`;
+    }
+  } finally {
+    State.loading = false;
+}
+
+function handleImgError(img, chain) {
+    let currentSrc = img.src;
+    let index = chain.indexOf(currentSrc);
+    if (index === -1) {
+        // Try to find it by partial match if sz/type params are messing with it
+        index = chain.findIndex(url => currentSrc.includes(url.split('?')[0]));
+    }
+
+    if (index < chain.length - 1) {
+        img.src = chain[index + 1];
+    } else {
+        img.onerror = null; // Prevent infinite loop
+    }
+}
+
+function renderProfileInfo(data) {
+    if (State.currentTab === 'agent') {
+        if (data && data.hasData && data.metadata) {
+            renderProfileCard('agent-profile-target', State.selectedLdap, 'Active Agent', {
+                'Supervisor': data.metadata.supervisor,
+                'Team / Site': data.metadata.team,
+                'Line of Business': data.metadata.lob
+            });
+        } else {
+            document.getElementById('agent-profile-target').innerHTML = `<div style="color:var(--text-secondary); font-style:italic; padding: 20px;">Select an agent to view profile...</div>`;
+        }
+    } else if (State.currentTab === 'team') {
+        if (data && data.hasData) {
+            renderProfileCard('team-profile-target', State.selectedSup, 'Supervisor', {
+                'Total Agents': data.agents?.length || 0,
+                'Total Audits': data.stats?.count || 0,
+                'LOB': data.metadata?.lob || 'N/A'
+            });
+        } else {
+            document.getElementById('team-profile-target').innerHTML = `<div style="color:var(--text-secondary); font-style:italic; padding: 20px;">Select a supervisor to view team...</div>`;
+        }
+    } else if (State.currentTab === 'cluster') {
+        if (data && data.hasData) {
+            renderProfileCard('cluster-profile-target', State.selectedMgr, 'Manager', {
+                'Total Supervisors': data.supervisors?.length || 0,
+                'Total Audits': data.stats?.count || 0
+            });
+        } else {
+            document.getElementById('cluster-profile-target').innerHTML = `<div style="color:var(--text-secondary); font-style:italic; padding: 20px;">Select a manager to view cluster...</div>`;
+        }
+    }
+}
+
+function renderView() {
+  destroyAllCharts();
+  renderProfileInfo(State.filteredData);
+  if (State.currentTab === 'agent') {
+    renderAgentView();
+  } else if (State.currentTab === 'team') {
+    renderTeamView();
+  } else if (State.currentTab === 'cluster') {
+    renderClusterView();
+  }
+}
+
+function renderAgentView() {
+  const data = State.filteredData;
+  const container = document.getElementById('view-content');
+  if (!container) return;
+
+  if (!data || !data.hasData) {
+    // Auto-try the next available month silently before showing empty state
+    const months = State.initialData?.months || [];
+    const currentIdx = months.indexOf(State.selectedMonth);
+    if (currentIdx < months.length - 1 && !State._autoJumped) {
+      State._autoJumped = true;
+      State.selectedMonth = months[currentIdx + 1];
+      const picker = document.getElementById('quality-month-picker');
+      if (picker) picker.value = State.selectedMonth;
+      fetchData();
+      return;
+    }
+    State._autoJumped = false;
+
+    container.innerHTML = `
+      <div class="card grid-span-4" style="text-align:center; padding: 80px;">
+        <i class="ph ph-mask-sad" style="font-size: 64px; color: var(--apple-gray); margin-bottom: 20px; display:block;"></i>
+        <div style="font-size: 20px; font-weight: 700;">No Data Found</div>
+        <div style="color: var(--text-secondary); margin-top: 8px;">We couldn't find any audits for ${State.selectedLdap} in ${State.selectedMonth}</div>
+        <button class="icon-button" style="margin: 24px auto 0; width: auto; padding: 0 20px; gap: 8px; border-radius: 20px; background: var(--apple-blue); color: white;" onclick="jumpToLatestData()">
+            <i class="ph ph-sparkle"></i> Jump to Latest Data
+        </button>
+      </div>
+    `;
+    return;
+  }
+  State._autoJumped = false;
+
+  const s = data.stats;
+
+  container.innerHTML = `
+    <!-- Top Opportunities & Strengths -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; grid-column: span 4; margin-bottom: 24px;">
+        ${renderTopOpportunities(s.groupedParams)}
+        ${renderTopStrengths(s.groupedParams)}
+    </div>
+
+    <!-- Top Level Cards -->
+    ${renderPremiumScoreCard('Customer Critical', s.customer || 0, s.targets.CUSTOMER)}
+    ${renderPremiumScoreCard('Business Critical', s.business || 0, s.targets.BUSINESS)}
+    ${renderPremiumScoreCard('Compliance Critical', s.compliance || 0, s.targets.COMPLIANCE)}
+    <div class="card">
+      <div class="card-title">Total Audits</div>
+      <div class="score-value">${s.count}</div>
+      <div class="trend-badge trend-up"><i class="ph ph-trend-up"></i> ${State.selectedMonth}</div>
+    </div>
+
+    <!-- Graphs -->
+    <div class="card">
+        <div class="card-title">Distribution</div>
+        <div id="chart-radar" style="height: 350px;"></div>
+    </div>
+
+    <div class="card grid-span-3">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px;">
+            <div class="card-title" style="margin:0;">Performance Trends</div>
+            <div class="segmented-control">
+                <button class="control-btn ${State.trendView === 'daily' ? 'active' : ''}" onclick="toggleTrendView('daily')">Daily</button>
+                <button class="control-btn ${State.trendView === 'weekly' ? 'active' : ''}" onclick="toggleTrendView('weekly')">Weekly</button>
+            </div>
+        </div>
+        <div id="chart-trends" style="height: 350px;"></div>
+    </div>
+
+    <!-- Heatmap Analytics -->
+    <div class="card grid-span-4">
+        <div class="card-title">Parameter Performance Heatmap</div>
+        <div id="chart-heatmap" style="height: 350px;"></div>
+    </div>
+
+    <!-- Parameter Breakdown -->
+    <div class="card grid-span-4">
+        <div class="card-title">Detailed Parameter Performance</div>
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 40px;">
+            ${renderParamGroup('Customer', s.groupedParams.customer)}
+            ${renderParamGroup('Business', s.groupedParams.business)}
+            ${renderParamGroup('Compliance', s.groupedParams.compliance)}
+        </div>
+    </div>
+
+    <!-- Case Breakdown -->
+    <div class="card grid-span-4">
+        <div class="audit-breakdown-header">
+            <div class="audit-breakdown-title">Case Lookup & Audit Details</div>
+            <div class="audit-filters">
+                <div class="search-cases-wrapper">
+                    <i class="ph ph-magnifying-glass"></i>
+                    <input type="text" id="audit-search-input" placeholder="Search cases or comments..." oninput="filterCaseList()">
+                </div>
+                <div class="segmented-control">
+                    <button class="control-btn ${State.auditFilter === 'all' ? 'active' : ''}" id="filter-all" onclick="setAuditFilter('all')">All</button>
+                    <button class="control-btn ${State.auditFilter === 'perfect' ? 'active' : ''}" id="filter-perfect" onclick="setAuditFilter('perfect')">Perfect</button>
+                    <button class="control-btn ${State.auditFilter === 'markdowns' ? 'active' : ''}" id="filter-markdowns" onclick="setAuditFilter('markdowns')">Markdowns</button>
+                </div>
+            </div>
+        </div>
+        <div class="case-list">
+            <div class="case-list-header" style="grid-template-columns: 180px 60px 60px 60px 1fr 120px;">
+                <div>CASE ID</div>
+                <div style="text-align:center;">CUST</div>
+                <div style="text-align:center;">BUS</div>
+                <div style="text-align:center;">COMP</div>
+                <div>MARKDOWNS</div>
+                <div style="text-align:right;">ACTION</div>
+            </div>
+            <div id="case-list-container">
+                ${data.caseLog.map((c, i) => renderCaseCard(c, i)).join('')}
+            </div>
+        </div>
+    </div>
+  `;
+
+  renderCharts(data);
+}
+
+function openModal(title, subtitle, contentHtml) {
+    const modal = document.getElementById('drilldown-modal');
+    const t = document.getElementById('modal-title');
+    const s = document.getElementById('modal-subtitle');
+    const b = document.getElementById('modal-body');
+
+    if (modal && t && s && b) {
+        t.textContent = title;
+        s.textContent = subtitle;
+        b.innerHTML = contentHtml;
+        modal.style.display = 'flex';
+    }
+}
+
+function closeModal(e) {
+    const modal = document.getElementById('drilldown-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+function parseScore(val) {
+    if (typeof val === 'number') return val;
+    if (val === null || val === undefined || val === '') return 0;
+    let s = String(val).replace('%', '').trim();
+    let n = parseFloat(s);
+    return isNaN(n) ? 0 : n;
+}
+
+function renderCaseCard(c, index) {
+    console.log('Case ID value:', c.caseId, '| Type:', typeof c.caseId, '| Index:', index);
+    const custScore = parseScore(c.customer);
+    const busScore = parseScore(c.business);
+    const compScore = parseScore(c.compliance);
+
+    const isScorePass = (s) => (s >= 99.9 || (s >= 0.999 && s <= 1.1));
+
+    const tags = [];
+    const catMap = { 'customer': { label: 'Cust', class: 'cust' }, 'business': { label: 'Bus', class: 'bus' }, 'compliance': { label: 'Comp', class: 'comp' } };
+
+    const catMarkdowns = { customer: false, business: false, compliance: false };
+
+    for (const cat in c.details) {
+        for (const param in c.details[cat]) {
+            const val = String(c.details[cat][param]).toLowerCase().trim();
+            if (val === 'no' || val === '0' || val === 'fail') {
+                const info = catMap[cat] || { label: cat, class: 'gray' };
+                tags.push(`<span class="markdown-tag tag-${info.class}">${info.label}: ${param.replace(/_/g, ' ')}</span>`);
+                catMarkdowns[cat] = true;
+            }
+        }
+
+        // Quality Improvement: If the critical score failed but no specific parameters were marked, add a generic Critical fail tag
+        const s = (cat === 'customer') ? custScore : (cat === 'business' ? busScore : compScore);
+        if (!isScorePass(s) && !catMarkdowns[cat]) {
+            const info = catMap[cat] || { label: cat, class: 'gray' };
+            tags.push(`<span class="markdown-tag tag-${info.class}" style="background: var(--apple-red); color: white;">Critical ${info.label} Fail</span>`);
+            catMarkdowns[cat] = true;
+        }
+    }
+
+    // A perfect audit must have 100% in all critical scores AND no markdown tags
+    const isPerfectAudit = isScorePass(custScore) && isScorePass(busScore) && isScorePass(compScore) && (tags.length === 0);
+
+    let markdownsHtml = '';
+    if (isPerfectAudit) {
+        markdownsHtml = '<span class="perfect-audit-text" style="color: var(--apple-green); font-weight: 700; font-size: 13px; display: flex; align-items: center; gap: 4px;"><i class="ph-fill ph-seal-check"></i> Perfect Audit!</span>';
+    } else if (tags.length === 0) {
+        // Fallback for cases where scores might be slightly off but no tags exist
+        markdownsHtml = '<span style="color: var(--text-secondary); font-size: 12px; font-style: italic;">No specific markdowns</span>';
+    } else {
+        markdownsHtml = `<div class="markdown-tags">${tags.join('')}</div>`;
+    }
+
+    const escapedComments = (c.comments || '').replace(/"/g, '&quot;').toLowerCase();
+
+    return `
+        <div class="case-card" data-perfect="${isPerfectAudit}" data-markdown="${!isPerfectAudit}" data-comments="${escapedComments}">
+            <div class="case-summary">
+                <div class="case-id-group">
+                    <div style="display:flex; align-items:center; gap: 4px; overflow: visible;">
+                        <i class="ph-bold ph-file-text" style="color: var(--text-secondary); font-size: 16px; flex-shrink: 0;"></i>
+                        <a href="https://cases.connect.corp.google.com/${c.caseId}" target="_blank" class="case-id-link">
+                            <span>${String(c.caseId || 'UNKNOWN').trim()}</span>
+                            <i class="ph ph-arrow-square-out" style="font-size: 11px;"></i>
+                        </a>
+                        <i class="ph ph-copy" style="cursor:pointer; color: var(--text-secondary); font-size:13px; flex-shrink: 0;" onclick="copyToClipboard('${c.caseId}')" title="Copy Case ID"></i>
+                    </div>
+                    <span class="case-date">${c.reviewDate}</span>
+                </div>
+                <div style="display:flex; align-items:center; justify-content:center;">
+                    ${statusIcon(!catMarkdowns.business)}
+                </div>
+                <div style="display:flex; align-items:center; justify-content:center;">
+                    ${statusIcon(!catMarkdowns.compliance)}
+                </div>
+                <div>${markdownsHtml}</div>
+                <div style="text-align:right; display:flex; gap:8px; justify-content: flex-end;">
+                    <button class="icon-button" style="width:32px; height:32px;" onclick="copyMarkdownSummary(${index})" title="Copy Markdown Summary">
+                        <i class="ph ph-share-network"></i>
+                    </button>
+                    <button class="details-btn" onclick="toggleCaseDetails(${index})">Details</button>
+                </div>
+            </div>
+            <div class="case-details-expanded" id="details-${index}">
+                <div class="reviewer-comments-box">
+                    <div class="reviewer-comments-title">Reviewer Comments:</div>
+                    <div class="reviewer-comments-text">"${c.comments || 'No comments'}"</div>
+                </div>
+                <div class="params-details-grid">
+                    ${renderParamDetailsCol('CUSTOMER', c.details.customer, 'cust')}
+                    ${renderParamDetailsCol('BUSINESS', c.details.business, 'bus')}
+                    ${renderParamDetailsCol('COMPLIANCE', c.details.compliance, 'comp')}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function renderParamDetailsCol(title, params, classSuffix) {
+    let rows = '';
+    const sortedKeys = Object.keys(params).sort();
+    for (const p of sortedKeys) {
+        const val = String(params[p]).toLowerCase();
+        // If it is truly empty/null from the sheet, we can show it as N/A or skip
+        // But let's show all available parameters to match user screenshot
+        if (val === 'undefined') continue;
+
+        const isPass = val === 'yes' || val === '1' || val === 'pass';
+        const isFail = val === 'no' || val === '0' || val === 'fail';
+        const displayVal = isPass ? 'PASS' : (isFail ? 'FAIL' : 'N/A');
+        const colorClass = isPass ? 'pass' : (isFail ? 'fail' : 'neutral');
+
+        rows += `
+            <div class="param-row">
+                <span class="param-label">${p.replace(/_/g, ' ').toLowerCase()}</span>
+                <span class="param-val ${colorClass}">${displayVal}</span>
+            </div>
+        `;
+    }
+    return `
+        <div>
+            <div class="param-col-title col-${classSuffix}">${title}</div>
+            <div class="param-rows-container">
+                ${rows}
+            </div>
+        </div>
+    `;
+}
+
+function setAuditFilter(filter) {
+    State.auditFilter = filter;
+    document.querySelectorAll('.audit-filters .control-btn').forEach(btn => btn.classList.remove('active'));
+    document.getElementById(`filter-${filter}`).classList.add('active');
+    filterCaseList();
+}
+
+function filterCaseList() {
+    const query = (document.getElementById('audit-search-input')?.value || '').toLowerCase();
+    const filter = State.auditFilter;
+    const cards = document.querySelectorAll('.case-card');
+
+    cards.forEach(card => {
+        const caseId = (card.getAttribute('data-caseid') || '');
+        const comments = (card.getAttribute('data-comments') || '');
+        const isPerfect = (card.getAttribute('data-perfect') === 'true');
+        const isMarkdown = (card.getAttribute('data-markdown') === 'true');
+
+        const matchesQuery = caseId.includes(query) || comments.includes(query);
+        let matchesFilter = true;
+
+        if (filter === 'perfect') {
+            matchesFilter = isPerfect;
+        } else if (filter === 'markdowns') {
+            matchesFilter = isMarkdown;
+        } else {
+            // 'all' filter - no restriction on perfect/markdown
+            matchesFilter = true;
+        }
+
+        card.style.display = (matchesQuery && matchesFilter) ? 'block' : 'none';
+    });
+}
+
+function toggleCaseDetails(index) {
+    const el = document.getElementById(`details-${index}`);
+    if (el) {
+        const isActive = el.classList.contains('active');
+        // Close all others maybe? No, let's allow multiple open.
+        el.classList.toggle('active');
+    }
+}
+
+function copyToClipboard(text, message = 'Case ID copied to clipboard') {
+    navigator.clipboard.writeText(text).then(() => {
+        const feedback = document.createElement('div');
+        feedback.style.position = 'fixed';
+        feedback.style.bottom = '20px';
+        feedback.style.left = '50%';
+        feedback.style.transform = 'translateX(-50%)';
+        feedback.style.background = 'rgba(0,0,0,0.8)';
+        feedback.style.color = 'white';
+        feedback.style.padding = '8px 16px';
+        feedback.style.borderRadius = '20px';
+        feedback.style.fontSize = '12px';
+        feedback.style.zIndex = '10000';
+        feedback.textContent = message;
+        document.body.appendChild(feedback);
+        setTimeout(() => feedback.remove(), 2000);
+    });
+}
+
+function copyMarkdownSummary(index) {
+    const data = State.filteredData;
+    if (!data || !data.caseLog[index]) return;
+    const c = data.caseLog[index];
+
+    let summary = `🚨 *Audit Feedback: Case ${c.caseId}* (${c.reviewDate})\n\n`;
+
+    // Scores
+    summary += `*Scores:*\n`;
+    summary += `• Customer: ${parseScore(c.customer).toFixed(1)}%\n`;
+    summary += `• Business: ${parseScore(c.business).toFixed(1)}%\n`;
+    summary += `• Compliance: ${parseScore(c.compliance).toFixed(1)}%\n\n`;
+
+    // Markdowns
+    let markdowns = [];
+    for (const cat in c.details) {
+        for (const p in c.details[cat]) {
+            const val = String(c.details[cat][p]).toLowerCase();
+            if (val === 'no' || val === '0' || val === 'fail') {
+                markdowns.push(`- [${cat.toUpperCase()}] ${p.replace(/_/g, ' ')}`);
+            }
+        }
+    }
+
+    if (markdowns.length > 0) {
+        summary += `*Opportunities:*\n${markdowns.join('\n')}\n\n`;
+    } else {
+        summary += `*Perfect Audit!* No markdowns identified.\n\n`;
+    }
+
+    summary += `*Comments:* \n"${c.comments || 'No comments'}"`;
+
+    copyToClipboard(summary, 'Markdown summary copied for coaching!');
+}
+
+function renderPremiumScoreCard(title, score, target) {
+    const s = Number(score) || 0;
+    const t = Number(target) || 0;
+    const isPass = s >= t;
+    return `
+        <div class="card">
+            <div class="card-title">${title}</div>
+            <div class="score-value" style="color: ${isPass ? 'var(--apple-green)' : 'var(--apple-red)'}">${s.toFixed(1)}%</div>
+            <div class="trend-badge ${isPass ? 'trend-up' : 'trend-down'}">
+                <i class="ph ${isPass ? 'ph-check-circle' : 'ph-warning'}"></i>
+                Target: ${t}%
+            </div>
+        </div>
+    `;
+}
+
+function jumpToLatestData() {
+    if (!State.initialData || !State.initialData.months || State.initialData.months.length === 0) return;
+
+    // We try each month starting from the newest until we find one with audits
+    const latestMonth = State.initialData.months[0];
+    if (latestMonth !== State.selectedMonth) {
+        const picker = document.getElementById('quality-month-picker');
+        if (picker) picker.value = latestMonth;
+        State.selectedMonth = latestMonth;
+        fetchData();
+    }
+}
+
+function renderTopStrengths(groupedParams) {
+    const strengths = [];
+    for (const cat in groupedParams) {
+        groupedParams[cat].forEach(p => {
+            if (p.score !== null && p.score >= 100) {
+                strengths.push({ ...p, category: cat });
+            }
+        });
+    }
+
+    const top3 = strengths.slice(0, 3);
+
+    if (top3.length === 0) {
+        return `
+            <div class="card" style="background: rgba(52, 199, 89, 0.05); border-color: rgba(52, 199, 89, 0.2); margin: 0;">
+                <div class="card-title" style="color: var(--apple-green); display: flex; align-items: center; gap: 8px;">
+                    <i class="ph-fill ph-medal"></i> Top Strengths
+                </div>
+                <div style="color: var(--text-secondary); font-size: 13px; font-style: italic; padding: 20px; text-align: center;">
+                    Keep pushing! Consistency is key to unlocking top strengths.
+                </div>
+            </div>
+        `;
+    }
+
+    const cards = top3.map(s => `
+        <div class="strength-mini-card">
+            <div class="str-header">
+                <span class="str-cat">${s.category}</span>
+                <span class="str-score"><i class="ph-fill ph-check-circle"></i> 100%</span>
+            </div>
+            <div class="str-name">${s.name.replace(/_/g, ' ')}</div>
+        </div>
+    `).join('');
+
+    return `
+        <div class="card" style="background: rgba(52, 199, 89, 0.05); border-color: rgba(52, 199, 89, 0.2); margin: 0;">
+            <div class="card-title" style="color: var(--apple-green); display: flex; align-items: center; gap: 8px;">
+                <i class="ph-fill ph-medal"></i> Top Strengths
+            </div>
+            <div class="strengths-grid">
+                ${cards}
+            </div>
+        </div>
+    `;
+}
+
+function renderTopOpportunities(groupedParams) {
+    // Flatten all parameters and filter out those without scores or with 100%
+    const allParams = [];
+    for (const cat in groupedParams) {
+        groupedParams[cat].forEach(p => {
+            if (p.score !== null && p.score < 100) {
+                allParams.push({ ...p, category: cat });
+            }
+        });
+    }
+
+    // Sort by score ascending
+    allParams.sort((a, b) => a.score - b.score);
+    const top3 = allParams.slice(0, 3);
+
+    if (top3.length === 0) {
+        return `
+            <div class="card" style="background: rgba(255, 149, 0, 0.05); border-color: rgba(255, 149, 0, 0.2); margin: 0;">
+                <div class="card-title" style="color: var(--apple-orange); display: flex; align-items: center; gap: 8px;">
+                    <i class="ph-fill ph-lightbulb"></i> Top Opportunities
+                </div>
+                <div style="color: var(--text-secondary); font-size: 13px; font-style: italic; padding: 20px; text-align: center;">
+                    Excellent work! No markdowns identified in this period.
+                </div>
+            </div>
+        `;
+    }
+
+    const tips = {
+        'LISTENING': 'Active listening and acknowledging customer concerns reduces dead air.',
+        'PROBING': 'Ask open-ended questions to uncover the root cause faster.',
+        'COMPLETE_RESOLUTION': 'Verify all customer issues are addressed before closing.',
+        'TROUBLESHOOTING': 'Follow the standard logic and double-check prerequisites.',
+        'EMPATHY': 'Acknowledge the customer\'s feelings to build rapport.',
+        'OWNERSHIP': 'Reassure the customer that you are handling their issue.',
+        'CONSULTS_ESCALATIONS': 'Check internal KB before consulting to save time.',
+        'AUTHENTICATION': 'Ensure strict adherence to verification protocols.',
+        'GOOGLE_ONLY_INFO': 'Sensitive data must never be shared externally.'
+    };
+
+    const oppCards = top3.map(o => `
+        <div class="opportunity-card">
+            <div class="opp-header">
+                <span class="opp-cat">${o.category}</span>
+                <span class="opp-score">${o.score.toFixed(0)}%</span>
+            </div>
+            <div class="opp-name">${o.name.replace(/_/g, ' ')}</div>
+            <div class="opp-tip">
+                <strong>Tip:</strong> ${tips[o.name] || 'Review the quality guidelines for this parameter to improve accuracy.'}
+            </div>
+        </div>
+    `).join('');
+
+    return `
+        <div class="card" style="background: rgba(255, 149, 0, 0.05); border-color: rgba(255, 149, 0, 0.2); margin: 0;">
+            <div class="card-title" style="color: var(--apple-orange); display: flex; align-items: center; gap: 8px;">
+                <i class="ph-fill ph-lightbulb"></i> Top Opportunities
+            </div>
+            <div class="opportunities-grid-vertical">
+                ${oppCards}
+            </div>
+        </div>
+    `;
+}
+
+function renderParamGroup(title, params) {
+    return `
+        <div class="param-group">
+            <div class="param-group-title">${title}</div>
+            <div class="param-list">
+                ${params.map(p => {
+                    const hasData = p.score !== null && !isNaN(p.score);
+                    const score = hasData ? Number(p.score) : 0;
+                    const scoreDisplay = hasData ? score.toFixed(0) + '%' : '—';
+
+                    let barColor = 'var(--apple-light-gray)';
+                    let textColor = 'var(--text-primary)';
+                    let weight = '500';
+
+                    if (hasData) {
+                        if (score >= 95) barColor = 'var(--apple-green)';
+                        else if (score >= 90) barColor = 'var(--apple-blue)';
+                        else if (score > 0) barColor = 'var(--apple-orange)';
+                        else {
+                            barColor = 'var(--apple-red)';
+                            textColor = 'var(--apple-red)';
+                            weight = '700';
+                        }
+                    } else {
+                        textColor = 'var(--text-secondary)';
+                    }
+
+                    return `
+                        <div class="param-item" style="${!hasData ? 'opacity: 0.5;' : ''}">
+                            <div class="param-info">
+                                <span class="param-name" style="color: ${hasData ? textColor : 'var(--text-secondary)'}; font-weight: ${weight}">${p.name.replace(/_/g, ' ')}</span>
+                                <span class="param-score" style="color: ${hasData ? textColor : 'var(--text-secondary)'}; font-weight: 700">${hasData ? scoreDisplay : 'N/A'}</span>
+                            </div>
+                            <div class="param-progress-bg">
+                                <div class="param-progress-fill" style="width: ${hasData ? score : 0}%; background: ${hasData ? barColor : 'var(--apple-light-gray)'}"></div>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function toggleTrendView(view) {
+    State.trendView = view;
+    renderAgentView();
+}
+
+function renderCharts(data) {
+    const s = data.stats;
+    if (!s) return;
+
+    const isDark = document.body.getAttribute('data-theme') === 'dark';
+    const chartOptions = {
+        chart: {
+            height: 350,
+            toolbar: { show: false },
+            fontFamily: 'Inter, -apple-system, sans-serif',
+            animations: { enabled: true, easing: 'easeinout', speed: 800 },
+            foreColor: isDark ? '#AEAEB2' : '#86868B'
+        },
+        dataLabels: { enabled: false },
+        stroke: { curve: 'smooth', width: 3, lineCap: 'round' },
+        grid: { borderColor: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)', strokeDashArray: 4 },
+        xaxis: {
+            axisBorder: { show: false },
+            axisTicks: { show: false },
+            labels: { style: { colors: isDark ? '#AEAEB2' : '#86868B' } }
+        },
+        yaxis: { labels: { style: { colors: isDark ? '#AEAEB2' : '#86868B' } }, min: 0, max: 100 },
+        tooltip: { theme: isDark ? 'dark' : 'light', x: { show: false } }
+    };
+
+    // Trends
+    const trendsEl = document.querySelector("#chart-trends");
+    const trendData = (State.trendView === 'daily') ? data.trends.daily : data.trends.weekly;
+
+    if (trendsEl && trendData && trendData.length > 0) {
+        const targets = s.targets || { CUSTOMER: 95, BUSINESS: 90, COMPLIANCE: 99.5 };
+        const series = [
+            { name: 'Customer', data: trendData.map(d => Number(d.customer || 0).toFixed(1)) },
+            { name: 'Business', data: trendData.map(d => Number(d.business || 0).toFixed(1)) },
+            { name: 'Compliance', data: trendData.map(d => Number(d.compliance || 0).toFixed(1)) }
+        ];
+
+        // Add Team Benchmarking Line if available
+        if (data.teamAvg && data.teamAvg.hasData && State.currentTab === 'agent') {
+            const teamAvgVal = ((data.teamAvg.customer + data.teamAvg.business + data.teamAvg.compliance) / 3).toFixed(1);
+            series.push({
+                name: 'Team Average',
+                type: 'line',
+                data: trendData.map(() => teamAvgVal)
+            });
+        }
+
+        new ApexCharts(trendsEl, {
+            ...chartOptions,
+            series: series,
+            chart: {
+                ...chartOptions.chart,
+                type: 'area',
+                events: {
+                    markerClick: function(event, chartContext, { seriesIndex, dataPointIndex, config }) {
+                        const label = trendData[dataPointIndex].label;
+                        handleTrendDrilldown(label);
+                    }
+                }
+            },
+            colors: ['#007AFF', '#34C759', '#FF3B30', '#8E8E93'],
+            xaxis: { ...chartOptions.xaxis, categories: trendData.map(d => d.label) },
+            stroke: {
+                ...chartOptions.stroke,
+                dashArray: [0, 0, 0, 8] // Dotted line for Team Average
+            },
+            annotations: {
+                yaxis: [
+                    { y: targets.CUSTOMER, borderColor: '#007AFF', label: { text: 'Cust Target', style: { color: '#fff', background: '#007AFF' } } },
+                    { y: targets.BUSINESS, borderColor: '#34C759', label: { text: 'Bus Target', style: { color: '#fff', background: '#34C759' } } },
+                    { y: targets.COMPLIANCE, borderColor: '#FF3B30', label: { text: 'Comp Target', style: { color: '#fff', background: '#FF3B30' } } }
+                ]
+            },
+            fill: {
+                type: 'gradient',
+                gradient: {
+                    shadeIntensity: 1,
+                    opacityFrom: 0.3,
+                    opacityTo: 0.05,
+                    stops: [0, 90, 100]
+                }
+            }
+        }).render();
+    }
+
+    // Radar
+    const radarEl = document.querySelector("#chart-radar");
+    if (radarEl) {
+        const targets = s.targets || { CUSTOMER: 95, BUSINESS: 90, COMPLIANCE: 99.5 };
+        const radarChart = new ApexCharts(radarEl, {
+            ...chartOptions,
+            series: [
+                {
+                    name: 'Current',
+                    data: [
+                        Number(s.customer || 0).toFixed(1),
+                        Number(s.business || 0).toFixed(1),
+                        Number(s.compliance || 0).toFixed(1)
+                    ]
+                },
+                {
+                    name: 'Target',
+                    data: [targets.CUSTOMER, targets.BUSINESS, targets.COMPLIANCE]
+                }
+            ],
+            chart: {
+                ...chartOptions.chart,
+                type: 'radar',
+                height: 350,
+                dropShadow: { enabled: true, blur: 8, left: 1, top: 1, opacity: 0.1 }
+            },
+            plotOptions: {
+                radar: {
+                    polygons: {
+                        strokeColors: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)',
+                        connectorColors: isDark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)',
+                        fill: { colors: isDark ? ['#2C2C2E', '#1C1C1E'] : ['#fcfcfc', '#fff'] }
+                    }
+                }
+            },
+            xaxis: {
+                categories: ['Customer', 'Business', 'Compliance'],
+                labels: { style: { colors: isDark ? '#AEAEB2' : '#86868B', fontWeight: 600 } }
+            },
+            yaxis: { show: false, min: 0, max: 100 },
+            colors: ['#007AFF', '#34C759'],
+            fill: { opacity: [0.35, 0.1] },
+            stroke: { show: true, width: 2 },
+            markers: { size: 0, hover: { size: 6 } },
+            legend: { position: 'bottom', horizontalAlign: 'center', offsetY: 10 }
+        });
+        radarChart.render();
+        _chartInstances.push(radarChart);
+    }
+
+    // Heatmap
+    const heatmapEl = document.querySelector("#chart-heatmap");
+    if (heatmapEl) {
+        const heatmapData = generateHeatmapData(data);
+        const heatmapChart = new ApexCharts(heatmapEl, {
+            ...chartOptions,
+            chart: {
+                ...chartOptions.chart,
+                type: 'heatmap',
+                height: 350
+            },
+            series: heatmapData.series,
+            plotOptions: {
+                heatmap: {
+                    shadeIntensity: 0.5,
+                    radius: 0,
+                    useFillColorAsStroke: true,
+                    colorScale: {
+                        ranges: [
+                            { from: 0, to: 0, name: 'Fail', color: '#FF3B30' },
+                            { from: 1, to: 89, name: 'Warning', color: '#FF9500' },
+                            { from: 90, to: 99, name: 'Good', color: '#007AFF' },
+                            { from: 100, to: 100, name: 'Perfect', color: '#34C759' }
+                        ]
+                    }
+                }
+            },
+            dataLabels: { enabled: false },
+            xaxis: {
+                ...chartOptions.xaxis,
+                categories: heatmapData.categories
+            }
+        });
+        heatmapChart.render();
+        _chartInstances.push(heatmapChart);
+    }
+}
+
+function generateHeatmapData(data) {
+    const params = State.initialData.paramCols || [];
+
+    if (State.currentTab === 'agent') {
+        const cases = data.caseLog.slice(0, 15);
+        const series = params.map(p => {
+        return {
+            name: p.replace(/_/g, ' '),
+            data: cases.map(c => {
+                const cat = Object.keys(c.details).find(cat => c.details[cat][p] !== undefined);
+                if (!cat) return null;
+                const val = String(c.details[cat][p]).toLowerCase().trim();
+                if (val === 'yes' || val === '1' || val === 'pass') return 100;
+                if (val === 'no' || val === '0' || val === 'fail') return 0;
+                return null;
+            })
+        };
+    }).filter(s => s.data.some(d => d !== null));
+
+        return {
+            series: series,
+            categories: cases.map(c => c.caseId.toString().slice(-6))
+        };
+    } else {
+        // Team View - Show Parameters vs Agents
+        const agents = data.agents.slice(0, 15);
+        const series = params.map(p => {
+            return {
+                name: p.replace(/_/g, ' '),
+                data: agents.map(a => {
+                    const pData = a.stats.groupedParams.customer.concat(a.stats.groupedParams.business, a.stats.groupedParams.compliance).find(gp => gp.name === p);
+                    return pData ? pData.score : null;
+                })
+            };
+        }).filter(s => s.data.some(d => d !== null));
+
+        return {
+            series: series,
+            categories: agents.map(a => a.ldap)
+        };
+    }
+}
+
+function handleTrendDrilldown(label) {
+    const data = State.filteredData;
+    if (!data || !data.caseLog) return;
+
+    const cases = data.caseLog.filter(c => {
+        if (State.trendView === 'daily') return c.reviewDate === label;
+        return true; // Simplified for now
+    });
+
+    if (cases.length === 0) return;
+
+    const html = `
+        <div class="case-list">
+            ${cases.map(c => `
+                <div style="display:grid; grid-template-columns: 1fr 2fr 1fr; padding: 12px 0; border-bottom: 1px solid rgba(0,0,0,0.03); align-items: center;">
+                    <div style="font-weight: 700; color: var(--apple-blue); cursor: pointer;" onclick="openCase('${c.caseId}'); closeModal();">${c.caseId}</div>
+                    <div style="font-size: 12px; color: var(--text-secondary);">${c.comments?.slice(0, 100) || 'No comments'}...</div>
+                    <div style="text-align:right;">${statusIcon(true)}</div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+
+    openModal(`Summary for ${label}`, `${cases.length} audits found`, html);
+}
+
+
+function renderTeamStrengthsOpportunities(stats) {
+    if (!stats || !stats.groupedParams) return '';
+
+    const allParams = [];
+    for (const cat in stats.groupedParams) {
+        stats.groupedParams[cat].forEach(p => {
+            if (p.score !== null && !isNaN(p.score)) {
+                allParams.push({ ...p, category: cat });
+            }
+        });
+    }
+
+    const opportunities = allParams.filter(p => p.score < 100).sort((a, b) => a.score - b.score).slice(0, 3);
+    const strengths = allParams.filter(p => p.score >= 100).slice(0, 3);
+
+    const tips = {
+        'LISTENING': 'Active listening and acknowledging customer concerns reduces dead air.',
+        'PROBING': 'Ask open-ended questions to uncover the root cause faster.',
+        'COMPLETE_RESOLUTION': 'Verify all customer issues are addressed before closing.',
+        'TROUBLESHOOTING': 'Follow the standard logic and double-check prerequisites.',
+        'EMPATHY': 'Acknowledge the customer\'s feelings to build rapport.',
+        'OWNERSHIP': 'Reassure the customer that you are handling their issue.',
+        'CONSULTS_ESCALATIONS': 'Check internal KB before consulting to save time.',
+        'AUTHENTICATION': 'Ensure strict adherence to verification protocols.',
+        'GOOGLE_ONLY_INFO': 'Sensitive data must never be shared externally.',
+        'CSAT_REMINDER': 'Always remind customers to complete the CSAT survey.',
+        'OPENING_CLOSING': 'Follow proper opening and closing protocols every interaction.',
+        'LANGUAGE_PROFICIENCY': 'Maintain clear and professional language throughout.',
+        'CASE_DETAILS': 'Ensure case notes are complete and accurate.',
+        'CATEGORIZATION': 'Tag cases with the correct category for tracking.',
+        'CASE_STATE': 'Keep case status updated at every step.',
+        'RESPONSIVENESS': 'Respond promptly and keep customers informed.',
+        'USER_EXPECTATIONS': 'Set clear expectations on timelines and next steps.',
+        'REFUNDS': 'Follow the refund policy guidelines accurately.',
+        'PROFESSIONAL_CONDUCT': 'Maintain professional tone and behavior at all times.',
+        'PAYMENT_COMPLAINTS': 'Handle payment complaints with empathy and accuracy.'
+    };
+
+    const oppHtml = opportunities.length === 0
+        ? `<div style="color:var(--text-secondary); font-size:13px; font-style:italic; padding:16px; text-align:center;">No team opportunities identified!</div>`
+        : opportunities.map(o => `
+            <div style="background:white; border-radius:12px; padding:12px 16px; border:1px solid rgba(0,0,0,0.05); display:flex; flex-direction:column; gap:6px;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px; color:var(--apple-blue);">${o.category}</span>
+                    <span style="font-size:13px; font-weight:700; color:var(--apple-red);">${o.score.toFixed(0)}%</span>
+                </div>
+                <div style="font-size:13px; font-weight:700; color:var(--text-primary);">${o.name.replace(/_/g, ' ')}</div>
+                <div style="font-size:11px; color:var(--text-secondary); background:var(--apple-light-gray); padding:6px 10px; border-radius:6px; border-left:3px solid var(--apple-orange);">
+                    ${tips[o.name] || 'Review quality guidelines for this parameter.'}
+                </div>
+            </div>
+        `).join('');
+
+    const strHtml = strengths.length === 0
+        ? `<div style="color:var(--text-secondary); font-size:13px; font-style:italic; padding:16px; text-align:center;">Keep pushing for 100% across all parameters!</div>`
+        : strengths.map(s => `
+            <div style="background:white; border-radius:12px; padding:12px 16px; border:1px solid rgba(52,199,89,0.15); display:flex; flex-direction:column; gap:6px;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px; color:var(--apple-blue);">${s.category}</span>
+                    <span style="font-size:13px; font-weight:700; color:var(--apple-green);"><i class="ph-fill ph-check-circle"></i> 100%</span>
+                </div>
+                <div style="font-size:13px; font-weight:700; color:var(--text-primary);">${s.name.replace(/_/g, ' ')}</div>
+            </div>
+        `).join('');
+
+    return `
+        <div style="background:rgba(255,149,0,0.05); border:1px solid rgba(255,149,0,0.2); border-radius:16px; padding:20px; display:flex; flex-direction:column; gap:12px;">
+            <div style="font-size:12px; font-weight:800; color:var(--apple-orange); text-transform:uppercase; letter-spacing:0.5px; display:flex; align-items:center; gap:6px;">
+                <i class="ph-fill ph-lightbulb"></i> Team Opportunities
+            </div>
+            <div style="display:flex; flex-direction:column; gap:10px;">${oppHtml}</div>
+        </div>
+        <div style="background:rgba(52,199,89,0.05); border:1px solid rgba(52,199,89,0.2); border-radius:16px; padding:20px; display:flex; flex-direction:column; gap:12px;">
+            <div style="font-size:12px; font-weight:800; color:var(--apple-green); text-transform:uppercase; letter-spacing:0.5px; display:flex; align-items:center; gap:6px;">
+                <i class="ph-fill ph-medal"></i> Team Strengths
+            </div>
+            <div style="display:flex; flex-direction:column; gap:10px;">${strHtml}</div>
+        </div>
+    `;
+}
+
+
+const _chartInstances = [];
+
+function destroyAllCharts() {
+  _chartInstances.forEach(c => { try { c.destroy(); } catch(e) {} });
+  _chartInstances.length = 0;
+}
+
+
+function renderProfileCard(targetId, ldap, label, metadata = {}) {
+    const target = document.getElementById(targetId);
+    if (!target) return;
+
+    const fallbackChain = [
+        `https://moma-teams-photos.corp.google.com/photos/${ldap}?sz=120&type=PLUS`,
+        `https://moma-teams-photos.corp.google.com/photos/${ldap}?sz=120&type=CUSTOM`,
+        `https://moma-teams-photos.corp.google.com/photos/${ldap}?sz=120`,
+        `https://ui-avatars.com/api/?name=${ldap}&background=007AFF&color=fff&size=120`
+    ];
+
+    target.innerHTML = `
+        <div class="profile-card-main fade-in">
+            <div class="profile-img-wrapper">
+                <img src="${fallbackChain[0]}" class="agent-profile-img"
+                    onerror='handleImgError(this, ${JSON.stringify(fallbackChain)})'>
+            </div>
+            <div class="profile-info-content">
+                <div class="profile-name-area">
+                    <div class="profile-name">${ldap}</div>
+                    <div class="profile-ldap-tag">${label}</div>
+                </div>
+                <div class="profile-meta-grid">
+                    ${Object.entries(metadata).map(([k, v]) => `
+                        <div class="profile-meta-item">
+                            <span class="profile-meta-label">${k}</span>
+                            <span class="profile-meta-value">${v || 'N/A'}</span>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function renderTeamView() {
+    const data = State.filteredData;
+    const container = document.getElementById('view-content');
+    if (!container) return;
+
+    if (!data || !data.hasData) {
+      container.innerHTML = `
+        <div class="card grid-span-4" style="text-align:center; padding: 80px;">
+          <i class="ph ph-mask-sad" style="font-size: 64px; color: var(--apple-gray); margin-bottom: 20px; display:block;"></i>
+          <div style="font-size: 20px; font-weight: 700;">No Team Data Found</div>
+          <div style="color: var(--text-secondary); margin-top: 8px;">Check selectors or ensure audits exist for ${State.selectedSup}</div>
+        </div>
+      `;
+      return;
+    }
+
+    const s = data.stats;
+    const avg = ((s.customer || 0) + (s.business || 0) + (s.compliance || 0)) / 3;
+    const supLdap = State.selectedSup || '';
+    const supFallbackChain = [
+        `https://moma-teams-photos.corp.google.com/photos/${supLdap}?sz=120&type=PLUS`,
+        `https://moma-teams-photos.corp.google.com/photos/${supLdap}?sz=120`,
+        `https://ui-avatars.com/api/?name=${encodeURIComponent(supLdap)}&background=007AFF&color=fff&size=120`
+    ];
+
+    container.innerHTML = `
+        <!-- Supervisor Strengths & Opportunities -->
+        <div class="grid-span-4" style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+            ${renderTeamStrengthsOpportunities(s)}
+        </div>
+
+        <!-- Score Cards -->
+        ${renderPremiumScoreCard('Customer Critical', s.customer || 0, s.targets.CUSTOMER)}
+        ${renderPremiumScoreCard('Business Critical', s.business || 0, s.targets.BUSINESS)}
+        ${renderPremiumScoreCard('Compliance Critical', s.compliance || 0, s.targets.COMPLIANCE)}
+        <div class="card">
+            <div class="card-title">Total Audits</div>
+            <div class="score-value">${s.count || 0}</div>
+            <div class="trend-badge trend-up"><i class="ph ph-trend-up"></i> ${State.selectedMonth}</div>
+        </div>
+
+        <!-- Charts -->
+        <div class="card">
+            <div class="card-title">Team Distribution</div>
+            <div id="chart-radar" style="height: 350px;"></div>
+        </div>
+        <div class="card grid-span-3">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 20px;">
+                <div class="card-title" style="margin:0;">Team Performance Trends</div>
+                <div class="segmented-control">
+                    <button class="control-btn ${State.trendView === 'daily' ? 'active' : ''}" onclick="toggleTeamTrendView('daily')">Daily</button>
+                    <button class="control-btn ${State.trendView === 'weekly' ? 'active' : ''}" onclick="toggleTeamTrendView('weekly')">Weekly</button>
+                </div>
+            </div>
+            <div id="chart-trends" style="height: 350px;"></div>
+        </div>
+
+        <!-- Heatmap Analytics -->
+        <div class="card grid-span-4">
+            <div class="card-title">Team Parameter Performance Heatmap</div>
+            <div id="chart-heatmap" style="height: 350px;"></div>
+        </div>
+
+        <!-- Agent Rankings Table -->
+        <div class="card grid-span-4">
+            <div class="card-title">Agent Rankings</div>
+            <div style="overflow-x:auto;">
+                <!-- Table Header -->
+                <div style="display:grid; grid-template-columns: 40px 220px 80px 80px 80px 80px 100px 1fr 90px 120px; gap:0; padding:10px 16px; background:rgba(0,0,0,0.02); border-radius:10px 10px 0 0; border-bottom:2px solid var(--apple-light-gray);">
+                    <div style="font-size:10px; font-weight:800; color:var(--text-secondary); text-transform:uppercase; letter-spacing:1px;">#</div>
+                    <div style="font-size:10px; font-weight:800; color:var(--text-secondary); text-transform:uppercase; letter-spacing:1px;">AGENT</div>
+                    <div style="font-size:10px; font-weight:800; color:var(--apple-blue); text-transform:uppercase; letter-spacing:1px; text-align:center;">CUST</div>
+                    <div style="font-size:10px; font-weight:800; color:var(--apple-green); text-transform:uppercase; letter-spacing:1px; text-align:center;">BUS</div>
+                    <div style="font-size:10px; font-weight:800; color:var(--apple-red); text-transform:uppercase; letter-spacing:1px; text-align:center;">COMP</div>
+                    <div style="font-size:10px; font-weight:800; color:var(--text-secondary); text-transform:uppercase; letter-spacing:1px; text-align:center;">AUDITS</div>
+                    <div style="font-size:10px; font-weight:800; color:var(--text-secondary); text-transform:uppercase; letter-spacing:1px; text-align:right;">QA AVG</div>
+                    <div style="font-size:10px; font-weight:800; color:var(--apple-orange); text-transform:uppercase; letter-spacing:1px; text-align:left; padding-left:16px;">TOP OPPORTUNITY</div>
+                    <div style="font-size:10px; font-weight:800; color:var(--text-secondary); text-transform:uppercase; letter-spacing:1px; text-align:center;">STATUS</div>
+                    <div style="font-size:10px; font-weight:800; color:var(--text-secondary); text-transform:uppercase; letter-spacing:1px; text-align:center;">COACHING</div>
+                </div>
+                <!-- Table Rows -->
+                ${data.agents.map((a, i) => {
+                    const cust = Number(a.stats.customer || 0);
+                    const bus = Number(a.stats.business || 0);
+                    const comp = Number(a.stats.compliance || 0);
+                    const agentAvg = (cust + bus + comp) / 3;
+                    const audits = a.stats.count || 0;
+                    const isPass = agentAvg >= 90;
+                    const agentFallback = [
+                        `https://moma-teams-photos.corp.google.com/photos/${a.ldap}?sz=60&type=PLUS`,
+                        `https://moma-teams-photos.corp.google.com/photos/${a.ldap}?sz=60`,
+                        `https://ui-avatars.com/api/?name=${a.ldap}&background=8E8E93&color=fff&size=60`
+                    ];
+                    const rankColors = ['#FFD700', '#C0C0C0', '#CD7F32'];
+                    const rankColor = i < 3 ? rankColors[i] : 'var(--apple-light-gray)';
+
+                    const scoreCell = (score, target) => {
+                        const pass = score >= target;
+                        return `<div style="text-align:center; font-size:13px; font-weight:700; color:${pass ? 'var(--apple-green)' : 'var(--apple-red)'};">${score.toFixed(1)}%</div>`;
+                    };
+
+                    return `
+                        <div style="display:grid; grid-template-columns: 40px 220px 80px 80px 80px 80px 100px 1fr 90px 120px; gap:0; padding:12px 16px; border-bottom:1px solid var(--apple-light-gray); align-items:center; transition:background 0.2s;" onmouseover="this.style.background='rgba(0,122,255,0.03)'" onmouseout="this.style.background='transparent'">
+                            <div style="width:28px; height:28px; border-radius:50%; background:${rankColor}; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:800; color:${i < 3 ? '#fff' : 'var(--text-secondary)'};">${i+1}</div>
+                            <div style="display:flex; align-items:center; gap:10px;">
+                                <img src="${agentFallback[0]}"
+                                    onerror='handleImgError(this, ${JSON.stringify(agentFallback)})'
+                                    style="width:32px; height:32px; border-radius:50%; object-fit:cover; border:2px solid white; box-shadow:0 2px 8px rgba(0,0,0,0.1); flex-shrink:0;">
+                                <div>
+                                    <div style="font-size:13px; font-weight:700; color:var(--text-primary); letter-spacing:-0.2px;">${a.ldap}</div>
+                                    <div style="font-size:10px; color:var(--text-secondary); font-weight:500;">${audits} audits</div>
+                                </div>
+                            </div>
+                            ${scoreCell(cust, s.targets.CUSTOMER)}
+                            ${scoreCell(bus, s.targets.BUSINESS)}
+                            ${scoreCell(comp, s.targets.COMPLIANCE)}
+                            <div style="text-align:center; font-size:13px; font-weight:600; color:var(--text-secondary);">${audits}</div>
+                            <div style="text-align:right;">
+                                <span style="font-size:14px; font-weight:800; color:${isPass ? 'var(--apple-green)' : 'var(--apple-red)'}; letter-spacing:-0.3px;">${agentAvg.toFixed(1)}%</span>
+                            </div>
+                            <div style="padding-left:16px;">
+                                ${(() => {
+                                    if (!a.stats.groupedParams) return '<span style="color:var(--text-secondary); font-size:11px;">—</span>';
+                                    const allP = [];
+                                    for (const cat in a.stats.groupedParams) {
+                                        a.stats.groupedParams[cat].forEach(p => {
+                                            if (p.score !== null && !isNaN(p.score) && p.score < 100) {
+                                                allP.push({...p, category: cat});
+                                            }
+                                        });
+                                    }
+                                    allP.sort((x, y) => x.score - y.score);
+                                    const top = allP[0];
+                                    if (!top) return '<span style="color:var(--apple-green); font-size:11px; font-weight:700;"><i class="ph-fill ph-seal-check"></i> Perfect!</span>';
+                                    const catColors = { customer: 'var(--apple-blue)', business: 'var(--apple-green)', compliance: 'var(--apple-red)' };
+                                    return `<span style="font-size:11px; font-weight:700; color:${catColors[top.category] || 'var(--apple-blue)'}; background:rgba(0,0,0,0.04); padding:3px 8px; border-radius:6px;">${top.name.replace(/_/g, ' ')} <span style="color:var(--apple-red);">${top.score.toFixed(0)}%</span></span>`;
+                                })()}
+                            </div>
+
+                            <!-- STATUS column -->
+                            <div style="text-align:center;">
+                                ${(() => {
+                                    const custPass = cust >= s.targets.CUSTOMER;
+                                    const busPass = bus >= s.targets.BUSINESS;
+                                    const compPass = comp >= s.targets.COMPLIANCE;
+                                    const allPass = custPass && busPass && compPass;
+                                    if (allPass) {
+                                        return `<span style="display:inline-flex; align-items:center; gap:4px; background:rgba(52,199,89,0.1); color:var(--apple-green); font-size:11px; font-weight:700; padding:4px 10px; border-radius:20px; border:1px solid rgba(52,199,89,0.2);"><i class="ph-fill ph-check-circle"></i> On Track</span>`;
+                                    } else {
+                                        const failCount = [custPass, busPass, compPass].filter(x => !x).length;
+                                        if (failCount >= 2) {
+                                            return `<span style="display:inline-flex; align-items:center; gap:4px; background:rgba(255,59,48,0.1); color:var(--apple-red); font-size:11px; font-weight:700; padding:4px 10px; border-radius:20px; border:1px solid rgba(255,59,48,0.2);"><i class="ph-fill ph-x-circle"></i> At Risk</span>`;
+                                        } else {
+                                            return `<span style="display:inline-flex; align-items:center; gap:4px; background:rgba(255,149,0,0.1); color:var(--apple-orange); font-size:11px; font-weight:700; padding:4px 10px; border-radius:20px; border:1px solid rgba(255,149,0,0.2);"><i class="ph-fill ph-warning"></i> Watch</span>`;
+                                        }
+                                    }
+                                })()}
+                            </div>
+
+                            <!-- COACHING FLAG column -->
+                            <div style="text-align:center;">
+                                ${(() => {
+                                    const custPass = cust >= s.targets.CUSTOMER;
+                                    const busPass = bus >= s.targets.BUSINESS;
+                                    const compPass = comp >= s.targets.COMPLIANCE;
+                                    const flags = [];
+                                    if (!custPass) flags.push(`<span style="font-size:10px; font-weight:700; background:rgba(0,122,255,0.1); color:var(--apple-blue); padding:2px 6px; border-radius:4px; border:1px solid rgba(0,122,255,0.2);">CUST</span>`);
+                                    if (!busPass) flags.push(`<span style="font-size:10px; font-weight:700; background:rgba(52,199,89,0.1); color:var(--apple-green); padding:2px 6px; border-radius:4px; border:1px solid rgba(52,199,89,0.2);">BUS</span>`);
+                                    if (!compPass) flags.push(`<span style="font-size:10px; font-weight:700; background:rgba(255,59,48,0.1); color:var(--apple-red); padding:2px 6px; border-radius:4px; border:1px solid rgba(255,59,48,0.2);">COMP</span>`);
+                                    if (flags.length === 0) return `<span style="font-size:11px; color:var(--text-secondary);">—</span>`;
+                                    return `<div style="display:flex; gap:4px; flex-wrap:wrap; justify-content:center;">${flags.join('')}</div>`;
+                                })()}
+                            </div>
+
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        </div>
+    `;
+    renderCharts(data);
+}
+
+function renderClusterView() {
+    const data = State.filteredData;
+    const container = document.getElementById('view-content');
+    if (!container) return;
+
+    if (!data || !data.hasData) {
+      container.innerHTML = `<div class="card grid-span-4" style="text-align:center; padding: 80px;">No Cluster Data Found</div>`;
+      return;
+    }
+
+    const s = data.stats;
+    container.innerHTML = `
+        <div class="card grid-span-4" style="display:grid; grid-template-columns: repeat(4, 1fr); gap: 20px;">
+            ${renderMiniStat('Cust. Avg', Number(s.customer || 0).toFixed(1) + '%')}
+            ${renderMiniStat('Bus. Avg', Number(s.business || 0).toFixed(1) + '%')}
+            ${renderMiniStat('Comp. Avg', Number(s.compliance || 0).toFixed(1) + '%')}
+            ${renderMiniStat('Total Audits', s.count || 0)}
+        </div>
+
+        <div class="card">
+            <div class="card-title">Cluster Distribution</div>
+            <div id="chart-radar" style="height: 350px;"></div>
+        </div>
+        <div class="card grid-span-3">
+            <div class="card-title">Cluster Performance Trends</div>
+            <div id="chart-trends" style="height: 350px;"></div>
+        </div>
+
+        <div class="card grid-span-4">
+            <div class="card-title">Supervisor Rankings</div>
+            <div class="ranking-list">
+                ${data.supervisors.map((sup, i) => {
+                    const supAvg = ((Number(sup.stats.customer) || 0) + (Number(sup.stats.business) || 0) + (Number(sup.stats.compliance) || 0)) / 3;
+                    return `
+                        <div class="ranking-item">
+                            <div class="rank-num">${i+1}</div>
+                            <div class="rank-ldap" style="width: 200px;">${sup.name}</div>
+                            <div class="rank-bar-bg"><div class="rank-bar-fill" style="width: ${supAvg}%; background: var(--apple-blue);"></div></div>
+                            <div class="rank-score">${supAvg.toFixed(1)}%</div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        </div>
+    `;
+    renderCharts(data);
+}
+
+function renderMiniStat(label, val) {
+    return `
+        <div style="text-align:center;">
+            <div style="font-size:11px; font-weight:700; color:var(--text-secondary); text-transform:uppercase; margin-bottom:8px;">${label}</div>
+            <div style="font-size:24px; font-weight:800;">${val}</div>
+        </div>
+    `;
+}
+
+// Helpers
+function callServer(method, args = []) {
+  return new Promise((resolve, reject) => {
+    google.script.run
+      .withSuccessHandler(resolve)
+      .withFailureHandler(reject)
+      [method](...args);
+  });
+}
+
+function showLoader(show) {
+  const loader = document.getElementById('app-loader');
+  if (loader) loader.style.display = show ? 'flex' : 'none';
+}
+
+function switchTab(tab) {
+  const scrollEl = document.querySelector('.scroll-container');
+  if (scrollEl) scrollEl.scrollTop = 0;
+  State.currentTab = tab;
+  localStorage.setItem('q_last_tab', tab);
+
+  // Reset stale selections when switching tabs to avoid cross-tab fetch errors
+  if (tab === 'team' && !State.selectedSup) State.selectedSup = '';
+  if (tab === 'cluster' && !State.selectedMgr) State.selectedMgr = '';
+
+  // Sidebar UI
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  const activeNav = document.getElementById(`nav-${tab}`);
+  if (activeNav) activeNav.classList.add('active');
+
+  // Header UI
+  const title = document.getElementById('page-title');
+  const subtitle = document.getElementById('page-subtitle');
+  if (tab === 'agent') {
+      title.textContent = 'Agent Performance';
+      subtitle.textContent = 'Personal Quality Score Overview';
+  } else if (tab === 'team') {
+      title.textContent = 'Team Rankings';
+      subtitle.textContent = 'Supervisor Group Performance';
+  } else {
+      title.textContent = 'Cluster Overview';
+      subtitle.textContent = 'Manager Level Aggregations';
+  }
+
+  // Selectors visibility
+  const selAgent = document.getElementById('selector-agent');
+  const selTeam = document.getElementById('selector-team');
+  const selCluster = document.getElementById('selector-cluster');
+
+  if (selAgent) selAgent.style.display = tab === 'agent' ? 'flex' : 'none';
+  if (selTeam) selTeam.style.display = tab === 'team' ? 'flex' : 'none';
+  if (selCluster) selCluster.style.display = tab === 'cluster' ? 'flex' : 'none';
+
+  fetchData();
+}
+
+function forceRefresh() {
+  const btn = document.querySelector('.refresh-btn');
+  if (btn) btn.classList.add('spinning');
+
+  _agentListCache = null;
+  _supListCache = null;
+
+  // Clear frontend session and local cache
+  try {
+      sessionStorage.clear();
+      localStorage.removeItem('q_initial_data_v2');
+      localStorage.removeItem('q_meta_cache');
+      localStorage.removeItem('q_last_ldap');
+  } catch(e) {}
+
+  initApp(true).finally(() => {
+    if (btn) btn.classList.remove('spinning');
+  });
+}
+
+function openCase(caseId) {
+    if (!caseId) return;
+    var url = 'https://cases.connect.corp.google.com/' + String(caseId).trim();
+    google.script.run
+        .withSuccessHandler(function() {})
+        .withFailureHandler(function() {});
+    window.open(url, '_blank');
+}
+
+function toggleTeamTrendView(view) {
+    State.trendView = view;
+    renderTeamView();
+}
+
+</script>
