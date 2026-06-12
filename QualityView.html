@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quality Dashboard</title>
+  <!-- ApexCharts -->
+  <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+  <!-- Google Fonts -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <!-- Phosphor Icons -->
+  <script src="https://unpkg.com/@phosphor-icons/web"></script>
+
+  <?!= HtmlService.createHtmlOutputFromFile('QualityView_CSS').getContent(); ?>
+</head>
+<body class="apple-style">
+  <div id="app-loader" class="q-loader-overlay">
+    <div class="q-spinner"></div>
+    <div class="loader-text">Initializing Dashboard...</div>
+  </div>
+
+  <div id="quality-root" class="app-layout" style="display:none">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="app-logo">
+          <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/2/2f/Google_Play_2022_icon.svg/960px-Google_Play_2022_icon.svg.png" style="width: 24px; height: 24px;">
+        </div>
+        <div class="app-name">GenQA Scores</div>
+      </div>
+
+      <nav class="sidebar-nav">
+        <div class="nav-group">
+          <div class="nav-item" id="nav-theme-toggle" onclick="toggleDarkMode()">
+            <i class="ph ph-moon" id="theme-icon"></i>
+            <span id="theme-text">Dark Mode</span>
+          </div>
+          <div style="height: 1px; background: var(--glass-border); margin: 12px 8px;"></div>
+          <div class="nav-item active" id="nav-agent" onclick="switchTab('agent')">
+            <i class="ph ph-user"></i>
+            <span>Agent Scores</span>
+          </div>
+          <div class="nav-item" id="nav-team" onclick="switchTab('team')">
+            <i class="ph ph-users"></i>
+            <span>Team Scores</span>
+          </div>
+          <div class="nav-item" id="nav-cluster" onclick="switchTab('cluster')">
+            <i class="ph ph-buildings"></i>
+            <span>Cluster Scores</span>
+          </div>
+        </div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="user-profile">
+          <div class="user-avatar" id="user-initials">--</div>
+          <div class="user-info">
+            <div class="user-name" id="user-ldap">User</div>
+            <div class="user-role">Quality Dashboard</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+      <header class="content-header">
+        <div class="header-left">
+          <h1 id="page-title">Agent Performance</h1>
+          <p id="page-subtitle">Personal Quality Score Overview</p>
+        </div>
+        <div class="header-right">
+          <div class="control-group">
+            <div class="select-wrapper">
+              <i class="ph ph-calendar-blank"></i>
+              <select id="quality-month-picker" onchange="onMonthChange(this.value)">
+                <option value="">Loading...</option>
+              </select>
+            </div>
+            <button class="icon-button refresh-btn" onclick="forceRefresh()" title="Refresh Data">
+              <i class="ph-bold ph-arrows-clockwise"></i>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div class="scroll-container">
+        <!-- Selectors Section -->
+        <section class="selectors-section" id="selectors-container">
+          <!-- Agent Profile & Search -->
+          <div id="selector-agent" class="profile-and-search" style="display:none">
+            <div class="search-box">
+              <div class="input-group" style="width: 100%;">
+                <label>Agent Search</label>
+                <div class="search-input-wrapper">
+                  <i class="ph ph-magnifying-glass"></i>
+                  <input type="text" id="ldap-search-input" placeholder="Search LDAP..." autocomplete="off">
+                  <div id="ldap-autocomplete-list" class="autocomplete-dropdown"></div>
+                </div>
+              </div>
+            </div>
+            <div id="agent-profile-target" class="agent-profile-info"></div>
+          </div>
+
+          <!-- Team Selectors -->
+          <div id="selector-team" class="profile-and-search" style="display:none">
+            <div class="search-box">
+              <div class="input-group" style="width: 100%;">
+                <label>Supervisor Search</label>
+                <div class="search-input-wrapper">
+                  <i class="ph ph-magnifying-glass"></i>
+                  <input type="text" id="sup-search-input" placeholder="Search Supervisor..." autocomplete="off">
+                  <div id="sup-autocomplete-list" class="autocomplete-dropdown"></div>
+                </div>
+              </div>
+            </div>
+            <div id="team-profile-target" class="agent-profile-info"></div>
+          </div>
+
+          <!-- Cluster Selectors -->
+          <div id="selector-cluster" class="profile-and-search" style="display:none">
+            <div class="search-box">
+              <div class="input-group" style="width: 100%;">
+                <label>Manager Search</label>
+                <div class="search-input-wrapper">
+                  <i class="ph ph-magnifying-glass"></i>
+                  <input type="text" id="mgr-search-input" placeholder="Search Manager..." autocomplete="off">
+                  <div id="mgr-autocomplete-list" class="autocomplete-dropdown"></div>
+                </div>
+              </div>
+            </div>
+            <div id="cluster-profile-target" class="agent-profile-info"></div>
+          </div>
+        </section>
+
+        <!-- Dashboard Content -->
+        <div id="view-content" class="dashboard-grid">
+           <!-- Dynamic Content Loads Here -->
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    // Bootstrap data from server
+    const BOOTSTRAP_DATA = <?!= bootstrap ?>;
+  </script>
+  <!-- Drill-down Modal -->
+  <div id="drilldown-modal" class="modal-overlay" style="display:none" onclick="closeModal(event)">
+    <div class="modal-content" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <div id="modal-title-area">
+            <h2 id="modal-title">Period Summary</h2>
+            <p id="modal-subtitle">Audit details for the selected period</p>
+        </div>
+        <button class="icon-button" onclick="closeModal()"><i class="ph ph-x"></i></button>
+      </div>
+      <div class="modal-body" id="modal-body">
+        <!-- Content dynamic -->
+      </div>
+    </div>
+  </div>
+
+  <?!= HtmlService.createHtmlOutputFromFile('QualityView_JS').getContent(); ?>
+</body>
+</html>
