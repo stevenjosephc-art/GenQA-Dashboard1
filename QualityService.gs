@@ -4,7 +4,7 @@
 // ============================================================
 
 var QUALITY_SHEET_NAME = 'PLX Raw data';
-var CACHE_VERSION = 'v1.2'; // Global cache invalidation (bumped for new source)
+var CACHE_VERSION = 'v1.8'; // Global cache invalidation (bumped for new source)
 var SOURCE_SPREADSHEET_ID = '1YDz16oRc2yi3sjyxtRPmaJbljyRPfYmwxVzuqiXu4Vw';
 
 // ── SCHEMA MAPPING ────────────────────────────────────────────────────────
@@ -18,7 +18,7 @@ function getColMapping() {
   var sheet = ss.getSheetByName(QUALITY_SHEET_NAME);
   if (!sheet) throw new Error("Sheet '" + QUALITY_SHEET_NAME + "' not found.");
 
-  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var headers = sheet.getRange(2, 1, 1, sheet.getLastColumn()).getValues()[0];
   var map = {};
 
   var find = function(pattern) {
@@ -38,49 +38,48 @@ function getColMapping() {
     return -1;
   };
 
-  map.CASE_ID = find('case_id') !== -1 ? find('case_id') : (find('case_#') !== -1 ? find('case_#') : (find('case_number') !== -1 ? find('case_number') : find('case')));
-  map.ENTITY_GROUP = find('billing_entity_group');
-  map.AGENT_LDAP = find('agent_ldap');
-  map.OPENING_CHANNEL = find('opening_channel');
-  map.REVIEW_DATE = find('review_date');
-  map.REVIEW_WEEK = find('review_week');
-  map.REVIEW_MONTH = find('review_month');
-  map.CASE_DATE = find('case_start_day');
-  map.CASE_WEEK = find('case_start_week');
-  map.CASE_MONTH = find('case_start_month');
-  map.CUSTOMER_CRITICAL = find('Customer');
-  map.BUSINESS_CRITICAL = find('Business');
-  map.COMPLIANCE_CRITICAL = find('Compliance');
-  map.REVIEWER_COMMENTS = find('comment');
+  map.CASE_ID = find('__case_id__1');
+map.ENTITY_GROUP = find('__billing_entity_group_name__1');
+map.AGENT_LDAP = find('__agent_ldap__1');
+map.OPENING_CHANNEL = find('__opening_channel__1');
+map.REVIEW_DATE = find('__qplus_review_date__1');
+map.REVIEW_WEEK = find('__qplus_review_week__1');
+map.REVIEW_MONTH = find('__qplus_review_month__1');
+map.CASE_DATE = find('__case_start_day__1');
+map.CASE_WEEK = find('__case_start_week__1');
+map.CASE_MONTH = find('__case_start_month__1');
+map.CUSTOMER_CRITICAL = find('Customer');
+map.BUSINESS_CRITICAL = find('Business');
+map.COMPLIANCE_CRITICAL = find('Compliance');
+map.REVIEWER_COMMENTS = find('Comment');
 
-  // Critical Parameters
-  map.LISTENING = find('listening');
-  map.PROBING = find('probing');
-  map.COMPLETE_RESOLUTION = find('complete_resolution');
-  map.TROUBLESHOOTING = find('troubleshooting');
-  map.USER_EXPECTATIONS = find('user_expectations');
-  map.EMPATHY = find('empathy');
-  map.OWNERSHIP = find('ownership');
-  map.REFUNDS = find('refunds');
-  map.RESPONSIVENESS = find('responsiveness');
+map.LISTENING = find('Listening');
+map.PROBING = find('Probing');
+map.COMPLETE_RESOLUTION = find('Providing Complete Resolution');
+map.TROUBLESHOOTING = find('Troubleshooting');
+map.USER_EXPECTATIONS = find('User Expectations');
+map.EMPATHY = find('Empathizing');
+map.OWNERSHIP = find('Ownership');
+map.REFUNDS = find('Refunds');
+map.RESPONSIVENESS = find('Responsiveness');
 
-  map.CONSULTS_ESCALATIONS = find('consults_escalations');
-  map.CASE_DETAILS = find('case_details');
-  map.CATEGORIZATION = find('categorization');
-  map.CSAT_REMINDER = find('csat_reminder');
-  map.CASE_STATE = find('case_state');
-  map.OPENING_CLOSING = find('opening_closing');
-  map.LANGUAGE_PROFICIENCY = find('language_proficiency');
+map.CONSULTS_ESCALATIONS = find('Consults');
+map.CASE_DETAILS = find('Case details');
+map.CATEGORIZATION = find('Categorization');
+map.CSAT_REMINDER = find('CSAT reminder');
+map.CASE_STATE = find('Case state');
+map.OPENING_CLOSING = find('Opening');
+map.LANGUAGE_PROFICIENCY = find('Language Proficiency');
 
-  map.AUTHENTICATION = find('authentication');
-  map.GOOGLE_ONLY_INFO = find('google_only_info');
-  map.PROFESSIONAL_CONDUCT = find('professional_conduct');
-  map.PAYMENT_COMPLAINTS = find('payment_complaints');
+map.AUTHENTICATION = find('Authentication');
+map.GOOGLE_ONLY_INFO = find('Google-only');
+map.PROFESSIONAL_CONDUCT = find('Professional Conduct');
+map.PAYMENT_COMPLAINTS = find('Payment Complaints');
 
-  map.TEAM = find('team');
-  map.SUPERVISOR = find('supervisor');
-  map.MANAGER = find('manager');
-  map.LOB = find('lob');
+map.TEAM = find('Team');
+map.SUPERVISOR = find('Supervisor LDAP');
+map.MANAGER = find('Manager');
+map.LOB = find('LOB');
 
   Q_COLS = map;
   return map;
@@ -153,7 +152,9 @@ function getColumnsFromSheet(colIndices, forceRefresh) {
   // If we are fetching almost everything, just get the range
   // Otherwise, if columns are sparse, we might still just get the whole block
   // for simplicity in Apps Script, but limited by the actual used columns.
-  var raw = sheet.getRange(2, startCol, lastRow - 1, numCols).getValues();
+  var MAX_ROWS = 10000;
+  var effectiveRows = Math.min(lastRow - 1, MAX_ROWS);
+  var raw = sheet.getRange(3, startCol, effectiveRows, numCols).getValues();
 
   // Map back to the original order/indices requested
   return raw.map(function(row) {
@@ -187,7 +188,7 @@ function getRawQualityDataForMonth(month, forceRefresh) {
   var ss = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
   var sheet = ss.getSheetByName(QUALITY_SHEET_NAME);
   var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
+  if (lastRow < 3) return [];
 
   // 1. Fetch Month column to identify relevant rows
   var monthIndices = [Q_COLS.REVIEW_MONTH];
@@ -197,7 +198,7 @@ function getRawQualityDataForMonth(month, forceRefresh) {
   var firstMatch = -1, lastMatch = -1;
   for (var i = 0; i < monthRows.length; i++) {
     if (normalizeQualityMonth(monthRows[i][0]) === month) {
-      var rowIdx = i + 2;
+      var rowIdx = i + 3;
       relevantMap[rowIdx] = true;
       if (firstMatch === -1) firstMatch = rowIdx;
       lastMatch = rowIdx;
@@ -290,7 +291,15 @@ function normalizeQualityMonth(val) {
       return val.getFullYear() + '-' + ('0' + (val.getMonth() + 1)).slice(-2);
     }
   }
-  return String(val).trim();
+  var s = String(val).trim();
+  // Handle ISO string like "2026-03-31T16:00:00.000Z"
+  if (s.length >= 7 && s.indexOf('T') !== -1) {
+    var d = new Date(s);
+    try {
+      return Utilities.formatDate(d, getTz(), 'yyyy-MM');
+    } catch(e) {}
+  }
+  return s.substring(0, 7);
 }
 
 function normalizeLdap(val) {
@@ -645,13 +654,11 @@ function clientGetClusterQuality(manager, month, forceRefresh) {
 }
 
 function clientGetAllAgents() {
-  var ss = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
-  var sheet = ss.getSheetByName(QUALITY_SHEET_NAME);
   getColMapping();
   var rows = getColumnsFromSheet([Q_COLS.AGENT_LDAP]);
   var seen = {};
   for (var i = 0; i < rows.length; i++) {
-    var ldap = normalizeLdap(rows[i][Q_COLS.AGENT_LDAP]);
+    var ldap = normalizeLdap(rows[i][0]);
     if (ldap) seen[ldap] = true;
   }
   return Object.keys(seen).sort().map(function(ldap) {
@@ -660,26 +667,22 @@ function clientGetAllAgents() {
 }
 
 function clientGetAllSupervisors() {
-  var ss = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
-  var sheet = ss.getSheetByName(QUALITY_SHEET_NAME);
   getColMapping();
   var rows = getColumnsFromSheet([Q_COLS.SUPERVISOR]);
   var seen = {};
   for (var i = 0; i < rows.length; i++) {
-    var sup = String(rows[i][Q_COLS.SUPERVISOR]).trim();
+    var sup = String(rows[i][0]).trim();
     if (sup) seen[sup] = true;
   }
   return Object.keys(seen).sort();
 }
 
 function clientGetAllManagers() {
-  var ss = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
-  var sheet = ss.getSheetByName(QUALITY_SHEET_NAME);
   getColMapping();
   var rows = getColumnsFromSheet([Q_COLS.MANAGER]);
   var seen = {};
   for (var i = 0; i < rows.length; i++) {
-    var mgr = String(rows[i][Q_COLS.MANAGER]).trim();
+    var mgr = String(rows[i][0]).trim();
     if (mgr) seen[mgr] = true;
   }
   return Object.keys(seen).sort();
@@ -744,10 +747,10 @@ function clientGetHierarchy(forceRefresh) {
 
   for (var i = 0; i < rows.length; i++) {
     var r = rows[i];
-    var lob = String(r[0] || 'Unknown LOB').trim();
-    var sup = String(r[1] || 'Unknown Supervisor').trim();
-    var agent = normalizeLdap(r[2]);
-    var mgr = String(r[3] || '').trim();
+    var lob = String(r[Q_COLS.LOB] || 'Unknown LOB').trim();
+    var sup = String(r[Q_COLS.SUPERVISOR] || 'Unknown Supervisor').trim();
+    var agent = normalizeLdap(r[Q_COLS.AGENT_LDAP]);
+    var mgr = String(r[Q_COLS.MANAGER] || '').trim();
 
     if (agent) {
       if (!hierarchy[lob]) hierarchy[lob] = {};
@@ -891,4 +894,66 @@ function testNewSheet() {
   } catch(e) {
     Logger.log('EXCEPTION: ' + e.message);
   }
+}
+function debugHeaders() {
+  var ss = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
+  var sheet = ss.getSheetByName(QUALITY_SHEET_NAME);
+  var headers = sheet.getRange(2, 1, 1, sheet.getLastColumn()).getValues()[0];
+  Logger.log(JSON.stringify(headers));
+}
+
+function debugMyQuality() {
+  var months = getAvailableQualityMonths();
+  Logger.log('Months: ' + JSON.stringify(months));
+  
+  var result = clientGetMyQuality('stevenjosephc', months[0], true);
+  Logger.log('hasData: ' + result.hasData);
+  Logger.log('rowCount: ' + (result.caseLog ? result.caseLog.length : 0));
+  Logger.log('stats: ' + JSON.stringify(result.stats));
+  Logger.log('metadata: ' + JSON.stringify(result.metadata));
+}
+
+function debugLdapMatch() {
+  getColMapping();
+  var rows = getColumnsFromSheet([Q_COLS.AGENT_LDAP]);
+  // Print first 5 non-empty values
+  var count = 0;
+  for (var i = 0; i < rows.length; i++) {
+    var val = rows[i][Q_COLS.AGENT_LDAP];
+    if (val) {
+      Logger.log('Row ' + i + ': [' + val + ']');
+      if (++count >= 5) break;
+    }
+  }
+}
+
+function debugAgents() {
+  var agents = clientGetAllAgents();
+  Logger.log('Count: ' + agents.length);
+  Logger.log('First 5: ' + JSON.stringify(agents.slice(0, 5)));
+}
+
+function debugAgents2() {
+  var agents = clientGetAllAgents();
+  Logger.log('Count: ' + agents.length);
+  Logger.log('First 5: ' + JSON.stringify(agents.slice(0, 5)));
+}
+
+function debugMonths() {
+  getColMapping();
+  Logger.log('REVIEW_MONTH col index: ' + Q_COLS.REVIEW_MONTH);
+  var rows = getColumnsFromSheet([Q_COLS.REVIEW_MONTH]);
+  Logger.log('Total rows: ' + rows.length);
+  Logger.log('First 5 raw: ' + JSON.stringify(rows.slice(0, 5)));
+}
+
+function debugFindAgent() {
+  getColMapping();
+  var allRows = getRawQualityDataForMonth('2026-04', true);
+  Logger.log('Total rows for 2026-04: ' + allRows.length);
+  var found = allRows.filter(function(r) {
+    return String(r[Q_COLS.AGENT_LDAP]).toLowerCase().indexOf('steven') !== -1;
+  });
+  Logger.log('Matching rows: ' + found.length);
+  if (found.length > 0) Logger.log('Sample: ' + JSON.stringify(found[0]));
 }
