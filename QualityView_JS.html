@@ -106,6 +106,9 @@ async function initApp(forceRefresh = false) {
 
     if (!data) throw new Error("Server returned empty data. Check sheet connectivity.");
     State.initialData = data;
+    console.log('Hierarchy sample:', JSON.stringify(Object.keys(data.hierarchy || {})).slice(0, 200));
+    console.log('Months:', data.months);
+    console.log('Managers:', data.managers);
 
     // Persist for next time
     try { localStorage.setItem('q_initial_data_v2', JSON.stringify(data)); } catch (e) {}
@@ -279,7 +282,9 @@ function setupAutocomplete(id, type, dataFn) {
     }
 
     const items = dataFn();
+    console.log('Autocomplete items count:', items.length, 'Query:', val);
     const matches = items.filter(a => a.toLowerCase().includes(val)).slice(0, 10);
+    console.log('Matches:', matches);
 
     if (matches.length > 0) {
       matches.forEach(m => {
@@ -358,13 +363,17 @@ function getAllAgentsFromHierarchy() {
   const h = State.initialData.hierarchy;
   for (const lob in h) {
     for (const sup in h[lob]) {
-      if (Array.isArray(h[lob][sup])) {
-          h[lob][sup].forEach(a => agents.add(a));
+      const val = h[lob][sup];
+      if (Array.isArray(val)) {
+        val.forEach(a => agents.add(a));
+      } else if (typeof val === 'object') {
+        Object.keys(val).forEach(a => agents.add(a));
       }
     }
   }
   _agentListCache = Array.from(agents).sort();
-  return _agentListCache;
+console.log('Agent list count:', _agentListCache.length, 'Sample:', _agentListCache.slice(0, 5));
+return _agentListCache;
 }
 
 async function loadMetadata(forceRefresh = false) {
