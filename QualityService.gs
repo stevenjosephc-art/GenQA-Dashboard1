@@ -4,7 +4,7 @@
 // ============================================================
 
 var QUALITY_SHEET_NAME = 'PLX Raw data';
-var CACHE_VERSION = 'v1.8'; // Global cache invalidation (bumped for new source)
+var CACHE_VERSION = 'v1.9'; // Global cache invalidation (bumped for 110k row optimization)
 var SOURCE_SPREADSHEET_ID = '1YDz16oRc2yi3sjyxtRPmaJbljyRPfYmwxVzuqiXu4Vw';
 
 // ── SCHEMA MAPPING ────────────────────────────────────────────────────────
@@ -78,7 +78,8 @@ map.PAYMENT_COMPLAINTS = find('Payment Complaints');
 
 map.TEAM = find('Team');
 map.SUPERVISOR = find('Supervisor LDAP');
-map.MANAGER = find('Manager');
+map.MANAGER = find('Manager'); // Will fuzzy match "Manager's LDAP"
+if (map.MANAGER === -1) map.MANAGER = find('Manager\'s LDAP');
 map.LOB = find('LOB');
 
   Q_COLS = map;
@@ -131,43 +132,50 @@ function doGet() {
  * Fetches specific columns from the spreadsheet.
  * This is much faster than reading all columns for large sheets.
  */
-function getColumnsFromSheet(colIndices, forceRefresh) {
+function getColumnsFromSheet(colIndices) {
   var ss = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
   var sheet = ss.getSheetByName(QUALITY_SHEET_NAME);
   if (!sheet) return [];
 
   var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
+  if (lastRow < 3) return [];
+  var numRows = lastRow - 2;
 
-  // Sort and unique indices to fetch efficiently
-  var uniqueIndices = Array.from(new Set(colIndices)).sort(function(a, b){return a-b});
-  if (uniqueIndices[0] === -1) uniqueIndices.shift(); // Remove -1
+  // Filter out -1 and get unique indices
+  var uniqueIndices = [];
+  colIndices.forEach(function(idx) {
+    if (idx !== -1 && uniqueIndices.indexOf(idx) === -1) {
+      uniqueIndices.push(idx);
+    }
+  });
 
   if (uniqueIndices.length === 0) return [];
 
-  var startCol = uniqueIndices[0] + 1;
-  var endCol = uniqueIndices[uniqueIndices.length - 1] + 1;
-  var numCols = endCol - startCol + 1;
-
-  // If we are fetching almost everything, just get the range
-  // Otherwise, if columns are sparse, we might still just get the whole block
-  // for simplicity in Apps Script, but limited by the actual used columns.
-  var MAX_ROWS = 10000;
-  var effectiveRows = Math.min(lastRow - 1, MAX_ROWS);
-  var raw = sheet.getRange(3, startCol, effectiveRows, numCols).getValues();
-
-  // Map back to the original order/indices requested
-  return raw.map(function(row) {
-    var mappedRow = {};
-    colIndices.forEach(function(origIdx, i) {
-      if (origIdx === -1) {
-        mappedRow[i] = null;
-      } else {
-        mappedRow[i] = row[origIdx - (startCol - 1)];
-      }
-    });
-    return mappedRow;
+  // Fetch each column individually to minimize memory overhead for large/sparse datasets
+  var colData = {};
+  uniqueIndices.forEach(function(idx) {
+    try {
+      colData[idx] = sheet.getRange(3, idx + 1, numRows, 1).getValues();
+    } catch(e) {
+      Logger.log("Error fetching column " + idx + ": " + e.message);
+      colData[idx] = new Array(numRows).fill([null]);
+    }
   });
+
+  var result = [];
+  for (var r = 0; r < numRows; r++) {
+    var rowObj = {};
+    // Map by actual column index (fixes hierarchy and mapping bugs)
+    uniqueIndices.forEach(function(idx) {
+      rowObj[idx] = colData[idx][r][0];
+    });
+    // Also map by position in colIndices for backward compatibility
+    colIndices.forEach(function(idx, i) {
+      rowObj[i] = (idx === -1) ? null : colData[idx][r][0];
+    });
+    result.push(rowObj);
+  }
+  return result;
 }
 
 function getRawQualityDataForMonth(month, forceRefresh) {
@@ -185,51 +193,20 @@ function getRawQualityDataForMonth(month, forceRefresh) {
   }
 
   getColMapping();
-  var ss = SpreadsheetApp.openById(SOURCE_SPREADSHEET_ID);
-  var sheet = ss.getSheetByName(QUALITY_SHEET_NAME);
-  var lastRow = sheet.getLastRow();
-  if (lastRow < 3) return [];
-
-  // 1. Fetch Month column to identify relevant rows
-  var monthIndices = [Q_COLS.REVIEW_MONTH];
-  var monthRows = getColumnsFromSheet(monthIndices);
-
-  var relevantMap = {};
-  var firstMatch = -1, lastMatch = -1;
-  for (var i = 0; i < monthRows.length; i++) {
-    if (normalizeQualityMonth(monthRows[i][0]) === month) {
-      var rowIdx = i + 3;
-      relevantMap[rowIdx] = true;
-      if (firstMatch === -1) firstMatch = rowIdx;
-      lastMatch = rowIdx;
-    }
-  }
-
-  if (firstMatch === -1) return [];
-
-  // 2. Fetch the actual data for these rows
-  // To be efficient, we fetch the bounding box of these rows if they are mostly contiguous
-  var startRow = firstMatch;
-  var endRow = lastMatch;
-
   var neededCols = [];
   for (var key in Q_COLS) {
-    if (Q_COLS[key] !== -1) neededCols.push({key: key, idx: Q_COLS[key]});
+    if (Q_COLS[key] !== -1) neededCols.push(Q_COLS[key]);
   }
-  var colIndices = neededCols.map(function(c) { return c.idx; });
-  var maxCol = Math.max.apply(null, colIndices);
 
-  var rawRange = sheet.getRange(startRow, 1, endRow - startRow + 1, maxCol + 1).getValues();
+  var allRows = getColumnsFromSheet(neededCols);
   var data = [];
-  var caseIdIdx = Q_COLS.CASE_ID;
 
-  for (var j = 0; j < rawRange.length; j++) {
-    var row = rawRange[j];
-    var rowIndex = startRow + j;
-    if (relevantMap[rowIndex] && row[caseIdIdx]) {
+  for (var i = 0; i < allRows.length; i++) {
+    var r = allRows[i];
+    if (normalizeQualityMonth(r[Q_COLS.REVIEW_MONTH]) === month && r[Q_COLS.CASE_ID]) {
       var obj = {};
-      neededCols.forEach(function(c) {
-        obj[c.idx] = row[c.idx];
+      neededCols.forEach(function(idx) {
+        obj[idx] = r[idx];
       });
       data.push(obj);
     }
@@ -267,7 +244,7 @@ function getAvailableQualityMonths() {
   var seen = {};
   var tz = getTz();
   for (var i = 0; i < rows.length; i++) {
-    var month = rows[i][0];
+    var month = rows[i][Q_COLS.REVIEW_MONTH];
     if (month) {
       if (month instanceof Date) {
         try {
@@ -658,7 +635,7 @@ function clientGetAllAgents() {
   var rows = getColumnsFromSheet([Q_COLS.AGENT_LDAP]);
   var seen = {};
   for (var i = 0; i < rows.length; i++) {
-    var ldap = normalizeLdap(rows[i][0]);
+    var ldap = normalizeLdap(rows[i][Q_COLS.AGENT_LDAP]);
     if (ldap) seen[ldap] = true;
   }
   return Object.keys(seen).sort().map(function(ldap) {
@@ -671,7 +648,7 @@ function clientGetAllSupervisors() {
   var rows = getColumnsFromSheet([Q_COLS.SUPERVISOR]);
   var seen = {};
   for (var i = 0; i < rows.length; i++) {
-    var sup = String(rows[i][0]).trim();
+    var sup = String(rows[i][Q_COLS.SUPERVISOR] || '').trim();
     if (sup) seen[sup] = true;
   }
   return Object.keys(seen).sort();
@@ -682,7 +659,7 @@ function clientGetAllManagers() {
   var rows = getColumnsFromSheet([Q_COLS.MANAGER]);
   var seen = {};
   for (var i = 0; i < rows.length; i++) {
-    var mgr = String(rows[i][0]).trim();
+    var mgr = String(rows[i][Q_COLS.MANAGER] || '').trim();
     if (mgr) seen[mgr] = true;
   }
   return Object.keys(seen).sort();
@@ -752,7 +729,7 @@ function clientGetHierarchy(forceRefresh) {
     var agent = normalizeLdap(r[Q_COLS.AGENT_LDAP]);
     var mgr = String(r[Q_COLS.MANAGER] || '').trim();
 
-    if (agent) {
+    if (agent && agent !== 'null' && agent !== 'undefined') {
       if (!hierarchy[lob]) hierarchy[lob] = {};
       if (!hierarchy[lob][sup]) hierarchy[lob][sup] = {};
       hierarchy[lob][sup][agent] = true;
@@ -818,9 +795,9 @@ function prewarmAllCaches() {
   var seenMgrs = {};
 
   for (var i = 0; i < agentRows.length; i++) {
-    var ldap = normalizeLdap(agentRows[i][0]);
-    var sup  = String(agentRows[i][1] || '').trim();
-    var mgr  = String(agentRows[i][2] || '').trim();
+    var ldap = normalizeLdap(agentRows[i][Q_COLS.AGENT_LDAP]);
+    var sup  = String(agentRows[i][Q_COLS.SUPERVISOR] || '').trim();
+    var mgr  = String(agentRows[i][Q_COLS.MANAGER] || '').trim();
     if (ldap) seenAgents[ldap] = true;
     if (sup)  seenSups[sup]    = true;
     if (mgr)  seenMgrs[mgr]   = true;
@@ -920,7 +897,7 @@ function debugLdapMatch() {
   var count = 0;
   for (var i = 0; i < rows.length; i++) {
     var val = rows[i][Q_COLS.AGENT_LDAP];
-    if (val) {
+    if (val !== null && val !== undefined && val !== '') {
       Logger.log('Row ' + i + ': [' + val + ']');
       if (++count >= 5) break;
     }
@@ -944,6 +921,7 @@ function debugMonths() {
   Logger.log('REVIEW_MONTH col index: ' + Q_COLS.REVIEW_MONTH);
   var rows = getColumnsFromSheet([Q_COLS.REVIEW_MONTH]);
   Logger.log('Total rows: ' + rows.length);
+  // rows[i] is an object, but stringify will show it
   Logger.log('First 5 raw: ' + JSON.stringify(rows.slice(0, 5)));
 }
 
